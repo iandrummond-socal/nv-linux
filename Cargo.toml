@@ -1,0 +1,10 @@
+[workspace]
+members = ["crates/nv-core", "crates/nv-app"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[workspace.lints.clippy]
+all = "warn"

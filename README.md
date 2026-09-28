@@ -1,8 +1,11 @@
 # nv-linux
 
-A `coding` workspace in the Glitch system.
+nv-linux is a native Linux rebuild of Notational Velocity (the modeless, mouseless Mac note app, https://github.com/scrod/nv) for Omarchy (Arch + Hyprland). Searching is creating: one box at the top, every keystroke filters every note, Return opens the match or creates a new note. Notes are plain text files in a folder you own, and the app wears your current Omarchy theme and font.
 
-- **What** — _(one line; fill in)_
-- **How to run** — _(commands; fill in)_
-- **State** — see `STATE.md` (the head-pointer for where this left off).
-- **The Brain knows about this** — `glitch-mem/Memory/projects/nv-linux.md`.
+**Status:** in development.
+
+## Licence
+
+GPL-3.0-or-later, see LICENSE; behaviour reimplemented from the GPL-3.0 original.
+
+State: see STATE.md

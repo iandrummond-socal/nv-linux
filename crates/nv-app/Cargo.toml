@@ -1,0 +1,19 @@
+[package]
+name = "nv-app"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nv-core = { path = "../nv-core" }
+gtk = { version = "0.11.5", package = "gtk4", features = ["v4_22"] }
+async-channel = "2.5.0"
+chrono = "0.4.45"
+anyhow = "1.0.104"
+
+[[bin]]
+name = "nv-linux"
+path = "src/main.rs"

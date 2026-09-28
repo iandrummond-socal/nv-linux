@@ -10,3 +10,10 @@ client_secret*.json
 .mcp.json
 *.mcp.json
 .mcp.local.json
+
+# Build + reference
+/target
+/.reference
+/packaging/src
+/packaging/pkg
+*.pkg.tar.zst
