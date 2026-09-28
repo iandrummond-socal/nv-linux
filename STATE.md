@@ -1,13 +1,15 @@
 # nv-linux — STATE
 
 ## Where we left off
-Checkpoint 1 landed: the headless engine (storage, NV search, watcher, config, theme, library) with 62 tests incl. the never-lose-text sweep; 10k notes load in 0.32 s, 8 ms max per keystroke.
+Checkpoint 2 landed: the NV loop works in a real window — type-to-search, autocomplete (gro|ceries), Return-to-create, Up/Down/Tab/Esc, Ctrl+J/K, per-note undo, autosave, and nothing lost on close or Ctrl+Q. Level 4 steps 1–8 pass with screenshots.
 
 ## Current focus
-Checkpoint 2: the NV loop in a window (search field, list, editor, autosave).
+Checkpoint 3: live file changes, conflict copies, rename, Trash, restore, and live Omarchy theming.
 
 ## Next (1-3)
-- [ ]
+- [ ] Wire the watcher (external edits, deletes, renames) into the window
+- [ ] Ctrl+R rename · Ctrl+Shift+Delete trash · Ctrl+S restore
+- [ ] theming.rs live reload, then Level 4 steps 9–14
 
 ## Key files
 - crates/nv-core (engine, no GUI) · crates/nv-app (GTK 4 window)
