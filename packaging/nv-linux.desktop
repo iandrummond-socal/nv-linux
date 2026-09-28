@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=nv-linux
+GenericName=Notes
+Comment=Notational Velocity for Omarchy
+Exec=nv-linux
+Icon=nv-linux
+Terminal=false
+Categories=Utility;TextEditor;
+Keywords=notes;notational;velocity;search;text;
+StartupNotify=true
+StartupWMClass=com.parkavenueprojects.NvLinux

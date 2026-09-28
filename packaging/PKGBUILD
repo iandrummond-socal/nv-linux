@@ -1,0 +1,28 @@
+# Local-source PKGBUILD: the parent repo checkout is the source.
+# From packaging/ in a normal terminal: mise exec -- makepkg -si -d
+# mise supplies cargo; -d skips pacman's makedepends check so no second system
+# Rust is installed. gtk4 is already present. makepkg asks for sudo only at install.
+
+pkgname=nv-linux
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Notational Velocity for Omarchy: search-or-create plain-text notes'
+arch=('x86_64')
+license=('GPL-3.0-or-later')
+depends=('gtk4' 'glib2' 'glibc' 'gcc-libs')
+makedepends=('cargo')
+options=('!debug')
+
+build() {
+  cd "$startdir/.."
+  export CARGO_TARGET_DIR="$srcdir/target"
+  cargo build --release --locked -p nv-app
+}
+
+package() {
+  cd "$startdir/.."
+  install -Dm755 "$srcdir/target/release/nv-linux" "$pkgdir/usr/bin/nv-linux"
+  install -Dm644 "packaging/nv-linux.desktop" "$pkgdir/usr/share/applications/nv-linux.desktop"
+  install -Dm644 "packaging/nv-linux.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/nv-linux.svg"
+  install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/nv-linux/LICENSE"
+}
