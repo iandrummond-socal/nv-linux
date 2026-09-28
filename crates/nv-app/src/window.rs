@@ -1,11 +1,13 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
 use gtk::prelude::*;
 use gtk::{gio, glib};
-use nv_core::library::{Library, SaveOutcome};
+use nv_core::config::Config;
+use nv_core::library::{Change, Library, SaveOutcome};
 use nv_core::model::NoteId;
+use nv_core::watcher::{FolderWatcher, StoreEvent};
 use nv_core::Error;
 
 use crate::editor::Editor;
@@ -19,12 +21,14 @@ pub struct Controller {
     editor: Editor,
     library: RefCell<Library>,
     current_ids: RefCell<Vec<NoteId>>,
+    watcher: Option<FolderWatcher>,
+    renaming: Cell<Option<NoteId>>,
     toast_revealer: gtk::Revealer,
     toast_label: gtk::Label,
     toast_timer: RefCell<Option<glib::SourceId>>,
 }
 
-pub fn build_window(app: &gtk::Application, library: Library, autosave_ms: u64) -> Rc<Controller> {
+pub fn build_window(app: &gtk::Application, library: Library, config: &Config) -> Rc<Controller> {
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title("nv-linux")
@@ -34,7 +38,7 @@ pub fn build_window(app: &gtk::Application, library: Library, autosave_ms: u64) 
     window.add_css_class("nv");
     let search = SearchField::new();
     let list = NoteList::new();
-    let editor = Editor::new(autosave_ms);
+    let editor = Editor::new(config.autosave_ms);
     let entry = search.widget();
     entry.set_margin_top(8);
     entry.set_margin_bottom(8);
@@ -66,6 +70,24 @@ pub fn build_window(app: &gtk::Application, library: Library, autosave_ms: u64) 
     toast_revealer.set_child(Some(&toast_label));
     overlay.add_overlay(&toast_revealer);
     window.set_child(Some(&overlay));
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let (async_sender, async_receiver) = async_channel::unbounded();
+    let watch_result = FolderWatcher::start(&config.notes_dir, sender).and_then(|watcher| {
+        let _bridge = std::thread::Builder::new()
+            .name("nv-watch-bridge".into())
+            .spawn(move || {
+                while let Ok(event) = receiver.recv() {
+                    if async_sender.send_blocking(event).is_err() {
+                        break;
+                    }
+                }
+            })?;
+        Ok(watcher)
+    });
+    let (watcher, watch_error) = match watch_result {
+        Ok(watcher) => (Some(watcher), None),
+        Err(error) => (None, Some(format!("Live updates are off: {error}"))),
+    };
     let controller = Rc::new(Controller {
         window,
         search,
@@ -73,6 +95,8 @@ pub fn build_window(app: &gtk::Application, library: Library, autosave_ms: u64) 
         editor,
         library: RefCell::new(library),
         current_ids: RefCell::new(Vec::new()),
+        watcher,
+        renaming: Cell::new(None),
         toast_revealer,
         toast_label,
         toast_timer: RefCell::new(None),
@@ -91,6 +115,19 @@ pub fn build_window(app: &gtk::Application, library: Library, autosave_ms: u64) 
     controller.list.select(None);
     controller.editor.clear();
     controller.connect();
+    if let Some(message) = watch_error {
+        glib::g_warning!("nv-linux", "{}", message);
+        controller.toast(&message);
+    }
+    let weak = Rc::downgrade(&controller);
+    glib::spawn_future_local(async move {
+        while let Ok(event) = async_receiver.recv().await {
+            let Some(this) = weak.upgrade() else {
+                break;
+            };
+            this.apply_event(event);
+        }
+    });
     controller
 }
 
@@ -174,6 +211,9 @@ impl Controller {
             this.list.move_selection(-1);
         });
         self.add_action("flush", |this| this.save_pending());
+        self.add_action("restore", |this| this.restore());
+        self.add_action("rename", |this| this.begin_rename());
+        self.add_action("trash", |this| this.trash());
         let weak = Rc::downgrade(self);
         self.window.connect_close_request(move |_| {
             if let Some(this) = weak.upgrade() {
@@ -199,6 +239,193 @@ impl Controller {
         self.current_ids.replace(ids.clone());
         // Widget calls can synchronously re-enter the controller: release borrows first.
         self.list.set_notes(&ids);
+    }
+
+    fn requery(&self) {
+        self.refresh_list(&self.search.typed());
+    }
+
+    fn update_row(&self, id: NoteId) {
+        let row = self.library.borrow().get(id).map(RowData::from_note);
+        if let Some(row) = row {
+            self.list.update_row(row);
+        }
+    }
+
+    fn expect_write(&self, id: NoteId) {
+        let write = {
+            let library = self.library.borrow();
+            library.get(id).and_then(|note| {
+                library
+                    .fingerprint(id)
+                    .map(|hash| (note.path.clone(), hash))
+            })
+        };
+        if let (Some(watcher), Some((path, hash))) = (&self.watcher, write) {
+            watcher.expect_write(&path, hash);
+        }
+    }
+
+    fn apply_event(self: &Rc<Self>, event: StoreEvent) {
+        // Save before reloading so pending edits take the conflict-copy path.
+        self.save_pending();
+        let change = self.library.borrow_mut().apply_external(event);
+        match change {
+            Change::Updated(id) | Change::Renamed(id) => {
+                self.update_row(id);
+                if let Some((title, body, read_only)) = self.note_content(id) {
+                    self.editor.reload(id, &body);
+                    if self.editor.current() == Some(id) && !read_only {
+                        self.editor.set_banner(None);
+                    }
+                    if self.list.selected() == Some(id) && !self.search.is_rename_mode() {
+                        self.search.show_title(&title);
+                    }
+                }
+                self.requery();
+            }
+            Change::Added(id) => {
+                self.update_row(id);
+                self.requery();
+            }
+            Change::Removed(id) => {
+                if self.renaming.get() == Some(id) {
+                    self.cancel_rename();
+                }
+                if self.editor.current() == Some(id) {
+                    self.editor
+                        .set_banner(Some("Deleted on disk — Ctrl+S restores it"));
+                } else {
+                    self.library.borrow_mut().forget(id);
+                    self.editor.forget(id);
+                    self.list.remove_row(id);
+                    self.requery();
+                }
+            }
+            Change::None => {}
+        }
+    }
+
+    fn restore(self: &Rc<Self>) {
+        let Some(id) = self.editor.current() else {
+            return;
+        };
+        if !self.library.borrow().is_deleted_on_disk(id) {
+            return;
+        }
+        let text = self
+            .editor
+            .text_of(id)
+            .or_else(|| self.note_content(id).map(|(_, body, _)| body));
+        let Some(text) = text else {
+            return;
+        };
+        let result = self.library.borrow_mut().restore(id, &text);
+        match result {
+            Ok(new_id) => {
+                self.expect_write(new_id);
+                if self.renaming.get() == Some(id) {
+                    self.cancel_rename();
+                }
+                self.editor.forget(id);
+                self.list.remove_row(id);
+                self.update_row(new_id);
+                self.requery();
+                self.list.select(Some(new_id));
+                self.editor.show(new_id, &text, false);
+                self.editor.set_banner(None);
+                if let Some((title, _, _)) = self.note_content(new_id) {
+                    self.toast(&format!("Restored {title}"));
+                }
+            }
+            Err(error) => self.toast(&format!("Couldn't restore: {error}")),
+        }
+    }
+
+    fn begin_rename(self: &Rc<Self>) {
+        let Some(id) = self.list.selected() else {
+            return;
+        };
+        self.save_pending();
+        if let Some((title, _, _)) = self.note_content(id) {
+            self.renaming.set(Some(id));
+            self.search.set_rename_mode(true);
+            self.search.set_text_silently(&title);
+            self.search.focus_select_all();
+        }
+    }
+
+    fn cancel_rename(&self) {
+        self.renaming.set(None);
+        self.search.set_rename_mode(false);
+        self.search.focus_select_all();
+    }
+
+    fn finish_rename(self: &Rc<Self>) {
+        let Some(id) = self.renaming.get() else {
+            self.cancel_rename();
+            return;
+        };
+        let text = self.search.text();
+        let title = text.trim();
+        let unchanged = self
+            .note_content(id)
+            .is_some_and(|(old, _, _)| old == title);
+        if title.is_empty() || unchanged {
+            self.cancel_rename();
+            return;
+        }
+        let result = self.library.borrow_mut().rename(id, title);
+        match result {
+            Ok(()) => {
+                self.cancel_rename();
+                self.update_row(id);
+                // Rename keeps the row visible; the next search keystroke re-filters.
+                self.list.select(Some(id));
+                if let Some((title, _, _)) = self.note_content(id) {
+                    self.search.show_title(&title);
+                }
+            }
+            Err(error) => self.toast(&format!("Couldn't rename: {error}")),
+        }
+    }
+
+    fn select_by_user(self: &Rc<Self>, id: Option<NoteId>) {
+        self.list.select(id);
+        self.selected(id);
+    }
+
+    fn trash(self: &Rc<Self>) {
+        let Some(id) = self.list.selected().or_else(|| self.editor.current()) else {
+            return;
+        };
+        self.save_pending();
+        let next = {
+            let ids = self.current_ids.borrow();
+            ids.iter()
+                .position(|&candidate| candidate == id)
+                .and_then(|index| {
+                    ids.get(index + 1)
+                        .or_else(|| index.checked_sub(1).and_then(|previous| ids.get(previous)))
+                        .copied()
+                })
+        };
+        let result = self.library.borrow_mut().trash(id);
+        match result {
+            Ok(()) => {
+                if self.renaming.get() == Some(id) {
+                    self.cancel_rename();
+                }
+                self.editor.forget(id);
+                self.list.remove_row(id);
+                self.current_ids
+                    .borrow_mut()
+                    .retain(|&candidate| candidate != id);
+                self.select_by_user(next);
+                self.toast("Moved to Trash");
+            }
+            Err(error) => self.toast(&format!("Couldn't move to Trash: {error}")),
+        }
     }
 
     fn completion(&self, query: &str) -> Option<NoteId> {
@@ -235,6 +462,9 @@ impl Controller {
     }
 
     fn selected(self: &Rc<Self>, id: Option<NoteId>) {
+        if self.search.is_rename_mode() && self.renaming.get() != id {
+            self.cancel_rename();
+        }
         if let Some(id) = id {
             let switch = self.editor.current() != Some(id);
             if switch {
@@ -254,6 +484,10 @@ impl Controller {
     }
 
     fn activate_search(self: &Rc<Self>) {
+        if self.search.is_rename_mode() {
+            self.finish_rename();
+            return;
+        }
         if let Some(id) = self.list.selected() {
             if self.editor.current() != Some(id) {
                 self.save_pending();
@@ -280,6 +514,7 @@ impl Controller {
                 return;
             }
         };
+        self.expect_write(id);
         let row = self.library.borrow().get(id).map(RowData::from_note);
         if let Some(row) = row {
             let actual_title = row.title.clone();
@@ -293,6 +528,11 @@ impl Controller {
     }
 
     fn clear_search(self: &Rc<Self>) {
+        // Escape cancels the temporary rename view without clearing the saved query.
+        if self.search.is_rename_mode() {
+            self.cancel_rename();
+            return;
+        }
         self.save_pending();
         self.search.set_text_silently("");
         self.refresh_list("");
@@ -311,12 +551,15 @@ impl Controller {
         let result = self.library.borrow_mut().save(id, text);
         match result {
             Ok(SaveOutcome::Saved) => {
+                self.expect_write(id);
                 let row = self.library.borrow().get(id).map(RowData::from_note);
                 if let Some(row) = row {
                     self.list.update_row(row);
                 }
             }
             Ok(SaveOutcome::Conflict { copy_id }) => {
+                self.expect_write(id);
+                self.expect_write(copy_id);
                 let (original, copy) = {
                     let library = self.library.borrow();
                     (
@@ -335,10 +578,11 @@ impl Controller {
                     self.list.update_row(row);
                     self.toast(&message);
                 }
+                self.requery();
             }
-            Err(Error::ExternalChange(_)) => self.editor.set_banner(Some(
-                "This note's file was deleted on disk. Your text is still here.",
-            )),
+            Err(Error::ExternalChange(_)) => self
+                .editor
+                .set_banner(Some("Deleted on disk — Ctrl+S restores it")),
             Err(Error::ReadOnly(_)) => {}
             Err(error) => {
                 let title = self

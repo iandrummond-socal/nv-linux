@@ -40,8 +40,9 @@ pub fn run() -> glib::ExitCode {
             return;
         };
         match load_library() {
-            Ok((library, autosave_ms)) => {
-                let controller = crate::window::build_window(app, library, autosave_ms);
+            Ok((library, config)) => {
+                crate::theming::install(&config);
+                let controller = crate::window::build_window(app, library, &config);
                 let window = controller.window().clone();
                 controllers.borrow_mut().push(controller);
                 window.present();
@@ -78,6 +79,9 @@ pub fn run() -> glib::ExitCode {
         app.set_accels_for_action("win.focus-search", &["<Control>l"]);
         app.set_accels_for_action("win.next-note", &["<Control>j"]);
         app.set_accels_for_action("win.prev-note", &["<Control>k"]);
+        app.set_accels_for_action("win.restore", &["<Control>s"]);
+        app.set_accels_for_action("win.rename", &["<Control>r"]);
+        app.set_accels_for_action("win.trash", &["<Control><Shift>Delete"]);
         app.set_accels_for_action("app.quit", &["<Control>q"]);
         let quit = gio::SimpleAction::new("quit", None);
         let weak = app.downgrade();
@@ -95,7 +99,7 @@ pub fn run() -> glib::ExitCode {
     exit_code
 }
 
-fn load_library() -> nv_core::Result<(Library, u64)> {
+fn load_library() -> nv_core::Result<(Library, Config)> {
     // Propagate errors: a default fallback would bypass the configured notes directory.
     let config = Config::load()?;
     let store = NoteStore::open(
@@ -103,7 +107,7 @@ fn load_library() -> nv_core::Result<(Library, u64)> {
         &config.extension,
         Box::new(SystemTrasher),
     )?;
-    Ok((Library::new(store, config.sort), config.autosave_ms))
+    Ok((Library::new(store, config.sort), config))
 }
 
 fn flush_windows(app: &gtk::Application) {
