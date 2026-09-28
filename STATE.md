@@ -1,15 +1,15 @@
 # nv-linux — STATE
 
 ## Where we left off
-Checkpoint 3 landed: outside edits, deletes and renames show up live, conflict copies are kept, Ctrl+R renames, Ctrl+Shift+Delete trashes, Ctrl+S restores a note deleted on disk, and colours follow the Omarchy theme live. 10,000 notes stay instant on the release build.
+All four checkpoints landed: the app is feature-complete for v1 and packaged for Arch. Every validation level passes.
 
 ## Current focus
-Checkpoint 4: packaging — desktop entry, icon, PKGBUILD, README and the Super+Alt+N bind line.
+Install and daily use: `cd packaging && mise exec -- makepkg -si -d`, then bind Super+Alt+N (see README).
 
 ## Next (1-3)
-- [ ] packaging/nv-linux.desktop + SVG icon
-- [ ] PKGBUILD, checked with makepkg --printsrcinfo
-- [ ] README: install, keys, the Hyprland bind line
+- [ ] Install it and use it for real
+- [ ] Put it on GitHub (private) when ready
+- [ ] Later ideas: wiki links, tags, markdown preview, a terminal version
 
 ## Key files
 - crates/nv-core (engine, no GUI) · crates/nv-app (GTK 4 window)
