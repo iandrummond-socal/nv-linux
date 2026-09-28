@@ -1,0 +1,12 @@
+{
+  "slug": "nv-linux",
+  "kind": "coding",
+  "vcs": "git",
+  "has_src": true,
+  "scan_secrets": true,
+  "template_version": "base@1",
+  "proactivity": {
+    "surface": "advisor"
+  },
+  "status": "active"
+}
