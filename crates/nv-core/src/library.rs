@@ -139,9 +139,11 @@ impl Library {
     /// Re-create the retained title with the supplied text and a new identifier.
     /// The old note is forgotten only after creation succeeds.
     pub fn restore(&mut self, id: NoteId, body: &str) -> Result<NoteId> {
-        let title = self.note(id)?.title.clone();
-        let new_id = self.create(&title, body)?;
-        self.forget(id);
+        let new_id = self.store.create_replacing(id, body)?;
+        self.deleted_on_disk.remove(&id);
+        self.deleted_on_disk.remove(&new_id);
+        self.refresh(id);
+        self.refresh(new_id);
         Ok(new_id)
     }
 
@@ -430,7 +432,9 @@ mod tests {
         assert!(!lib.is_deleted_on_disk(id));
         assert!(!lib.is_deleted_on_disk(restored));
         let note = lib.get(restored).unwrap();
-        assert!(note.title.starts_with("lost"));
+        assert_eq!(note.title, "lost");
+        assert_eq!(note.path, path);
+        assert!(!lib.fields.contains_key(&id));
         assert_eq!(fs::read_to_string(&note.path).unwrap(), "unsaved");
         assert_eq!(lib.search("unsaved"), [restored]);
         lib.save(restored, "edited again").unwrap();

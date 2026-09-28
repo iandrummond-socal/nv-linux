@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -85,6 +85,7 @@ pub struct NoteStore {
     ext: String,
     trasher: Box<dyn Trasher>,
     entries: BTreeMap<NoteId, Entry>,
+    path_index: HashMap<PathBuf, NoteId>,
     next_id: NoteId,
 }
 
@@ -154,6 +155,7 @@ impl NoteStore {
             ext,
             trasher,
             entries: BTreeMap::new(),
+            path_index: HashMap::new(),
             next_id: 1,
         };
         for entry in fs::read_dir(&store.dir)? {
@@ -177,8 +179,17 @@ impl NoteStore {
     }
 
     fn available_path(&self, title: &str, ext: &str, own_id: Option<NoteId>) -> Result<PathBuf> {
+        self.available_path_ignoring(title, ext, own_id, None)
+    }
+
+    fn available_path_ignoring(
+        &self,
+        title: &str,
+        ext: &str,
+        own_id: Option<NoteId>,
+        own_path: Option<&Path>,
+    ) -> Result<PathBuf> {
         let base = sanitize_title(title);
-        let own_path = own_id.and_then(|id| self.get(id)).map(|note| &note.path);
         let disk_paths = fs::read_dir(&self.dir)?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<io::Result<Vec<_>>>()?;
@@ -199,7 +210,7 @@ impl NoteStore {
                 Some(entry.note.id) != own_id && entry.note.title.to_lowercase() == folded
             });
             let disk_collision = disk_paths.iter().any(|other| {
-                Some(other) != own_path
+                Some(other.as_path()) != own_path
                     && (other
                         .file_name()
                         .unwrap_or_default()
@@ -219,13 +230,33 @@ impl NoteStore {
     /// Create a note and return its stable session identifier.
     pub fn create(&mut self, title: &str, body: &str) -> Result<NoteId> {
         let path = self.available_path(title, &self.ext, None)?;
+        self.persist_new(&path, body)?;
+        self.reload(&path)
+    }
+
+    /// Re-create a retained note with a new identifier, keeping it on failure.
+    pub fn create_replacing(&mut self, old: NoteId, body: &str) -> Result<NoteId> {
+        let note = &self.entry(old)?.note;
+        let ext = note
+            .path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or(&self.ext);
+        let path = self.available_path(&note.title, ext, Some(old))?;
+        self.persist_new(&path, body)?;
+        let id = self.load(&path, true)?;
+        self.forget(old);
+        Ok(id)
+    }
+
+    fn persist_new(&self, path: &Path, body: &str) -> Result<()> {
         let mut temp = NamedTempFile::new_in(&self.dir)?;
         temp.write_all(body.as_bytes())?;
         temp.as_file().sync_all()?;
-        temp.persist_noclobber(&path)
+        temp.persist_noclobber(path)
             .map_err(|error| Error::Io(error.error))?;
         File::open(&self.dir)?.sync_all()?;
-        self.reload(&path)
+        Ok(())
     }
 
     fn check_disk(&self, id: NoteId) -> Result<()> {
@@ -297,7 +328,7 @@ impl NoteStore {
             .extension()
             .and_then(|ext| ext.to_str())
             .unwrap_or(&self.ext);
-        let new = self.available_path(new_title, ext, Some(id))?;
+        let new = self.available_path_ignoring(new_title, ext, Some(id), Some(&old))?;
         if new != old {
             // On Linux rename also handles case-only changes without an intermediate name.
             fs::rename(&old, &new)?;
@@ -315,12 +346,21 @@ impl NoteStore {
 
     /// Remove a cached note without touching the filesystem.
     pub fn forget(&mut self, id: NoteId) -> Option<Note> {
-        self.entries.remove(&id).map(|entry| entry.note)
+        let entry = self.entries.remove(&id)?;
+        // A replacement may already own the same path under its new identifier.
+        if self.path_index.get(&entry.note.path) == Some(&id) {
+            self.path_index.remove(&entry.note.path);
+        }
+        Some(entry.note)
     }
 
     /// Load or refresh a path, preserving the identifier of an existing note.
     /// Invalid or unreadable files return an error; directory loading logs and skips them.
     pub fn reload(&mut self, path: &Path) -> Result<NoteId> {
+        self.load(path, false)
+    }
+
+    fn load(&mut self, path: &Path, force_new: bool) -> Result<NoteId> {
         let path = self.absolute_path(path);
         if !accepted_path(&path) {
             return Err(io::Error::new(
@@ -333,7 +373,12 @@ impl NoteStore {
         let text = String::from_utf8_lossy(&bytes);
         let read_only = matches!(text, std::borrow::Cow::Owned(_));
         let body = text.into_owned();
-        let id = match self.id_for_path(&path) {
+        let existing = if force_new {
+            None
+        } else {
+            self.path_index.get(&path).copied()
+        };
+        let id = match existing {
             Some(id) => id,
             None => {
                 let id = self.next_id;
@@ -352,6 +397,7 @@ impl NoteStore {
             labels: String::new(),
             read_only,
         };
+        self.path_index.insert(note.path.clone(), id);
         self.entries.insert(id, Entry { note, fingerprint });
         Ok(id)
     }
@@ -366,16 +412,17 @@ impl NoteStore {
 
     pub fn id_for_path(&self, path: &Path) -> Option<NoteId> {
         let path = self.absolute_path(path);
-        self.entries
-            .values()
-            .find(|entry| entry.note.path == path)
-            .map(|entry| entry.note.id)
+        self.path_index.get(&path).copied()
     }
 
     /// Follow an external rename without changing the last known content fingerprint.
     pub fn set_path(&mut self, id: NoteId, path: PathBuf) {
         let path = self.absolute_path(&path);
         if let Some(entry) = self.entries.get_mut(&id) {
+            if self.path_index.get(&entry.note.path) == Some(&id) {
+                self.path_index.remove(&entry.note.path);
+            }
+            self.path_index.insert(path.clone(), id);
             entry.note.title = title_from_path(&path);
             entry.note.path = path;
         }
@@ -409,6 +456,69 @@ mod tests {
             }),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn path_index_tracks_rename_set_path_forget_and_trash() {
+        let root = tempdir().unwrap();
+        let mut notes = store(&root);
+        let id = notes.create("before", "body").unwrap();
+        let old = notes.get(id).unwrap().path.clone();
+        assert_eq!(notes.id_for_path(Path::new("before.txt")), Some(id));
+        notes.rename(id, "renamed").unwrap();
+        let renamed = notes.get(id).unwrap().path.clone();
+        assert_eq!(notes.id_for_path(&old), None);
+        assert_eq!(notes.id_for_path(&renamed), Some(id));
+
+        let moved = renamed.with_file_name("moved.md");
+        fs::rename(&renamed, &moved).unwrap();
+        notes.set_path(id, PathBuf::from("moved.md"));
+        assert_eq!(notes.id_for_path(&renamed), None);
+        assert_eq!(notes.id_for_path(&moved), Some(id));
+        assert_eq!(notes.reload(&moved).unwrap(), id);
+        assert_eq!(notes.path_index.len(), notes.entries.len());
+
+        notes.forget(id).unwrap();
+        assert_eq!(notes.id_for_path(&moved), None);
+        let reloaded = notes.reload(&moved).unwrap();
+        assert_ne!(reloaded, id);
+        assert_eq!(notes.id_for_path(&moved), Some(reloaded));
+        notes.trash(reloaded).unwrap();
+        assert_eq!(notes.id_for_path(&moved), None);
+        assert!(notes.path_index.is_empty());
+        assert!(notes.entries.is_empty());
+    }
+
+    #[test]
+    fn create_replacing_reuses_free_name_and_preserves_retaken_name() {
+        let root = tempdir().unwrap();
+        let mut notes = store(&root);
+        // Preserve the original extension rather than the store's creation default.
+        let path = root.path().join("notes/hound.MD");
+        fs::write(&path, "original").unwrap();
+        let old = notes.reload(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        let restored = notes.create_replacing(old, "restored").unwrap();
+        assert_ne!(restored, old);
+        assert!(notes.get(old).is_none());
+        assert_eq!(notes.get(restored).unwrap().path, path);
+        assert_eq!(notes.get(restored).unwrap().body, "restored");
+        assert_eq!(notes.id_for_path(&path), Some(restored));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "restored");
+
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, "external").unwrap();
+        let replacement = notes.create_replacing(restored, "local").unwrap();
+        let suffixed = path.with_file_name("hound 2.MD");
+        assert_ne!(replacement, restored);
+        assert!(notes.get(restored).is_none());
+        assert_eq!(notes.get(replacement).unwrap().path, suffixed);
+        assert_eq!(notes.get(replacement).unwrap().body, "local");
+        assert_eq!(notes.id_for_path(&path), None);
+        assert_eq!(notes.id_for_path(&suffixed), Some(replacement));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external");
+        assert_eq!(fs::read_to_string(&suffixed).unwrap(), "local");
+        assert_eq!(notes.all().len(), 1);
     }
 
     #[test]

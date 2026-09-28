@@ -1,10 +1,10 @@
 # nv-linux — STATE
 
 ## Where we left off
-Checkpoint 0 landed: Rust via mise, both crates compile as stubs, an empty window opens (NV_DEV=1). Build plan: plans/nv-linux-notational-velocity.md in the Brain.
+Checkpoint 1 landed: the headless engine (storage, NV search, watcher, config, theme, library) with 62 tests incl. the never-lose-text sweep; 10k notes load in 0.32 s, 8 ms max per keystroke.
 
 ## Current focus
-Checkpoint 1: the headless engine (storage, NV search, watcher, config, theme).
+Checkpoint 2: the NV loop in a window (search field, list, editor, autosave).
 
 ## Next (1-3)
 - [ ]
