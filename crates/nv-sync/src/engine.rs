@@ -429,8 +429,10 @@ impl Engine {
                 .keys()
                 .chain(remote.keys())
                 .chain(self.state.files.keys())
+                .map(String::as_str)
+                .chain(self.state.pending.iter().map(change_key))
                 .filter(|key| !scan.excluded.contains(*key))
-                .cloned()
+                .map(str::to_owned)
                 .collect();
             let plan: Vec<(Item, Action)> = keys
                 .into_iter()
@@ -472,6 +474,10 @@ impl Engine {
                 let name = display_name(&item);
                 match &action {
                     Action::Nothing { .. } => {
+                        dirty |= self.settle_pending(&item.key);
+                        continue;
+                    }
+                    Action::ForgetBase { .. } if item.base.is_none() => {
                         dirty |= self.settle_pending(&item.key);
                         continue;
                     }
@@ -1171,6 +1177,25 @@ mod tests {
         let report = engine.run_pass(false).unwrap();
         assert_eq!(report.deleted_remote, 1);
         assert!(!f.remote().contains_key("a.txt"));
+        f.assert_converged();
+    }
+
+    #[test]
+    fn engine_own_delete_echo_is_settled() {
+        let (f, mut engine) = synced(&["a.txt", "b.txt"]);
+        f.remove("a.txt");
+        let report = engine.run_pass(false).unwrap();
+        assert_eq!(report.deleted_remote, 1);
+
+        let report = engine.run_pass(false).unwrap();
+        assert!(engine.state().pending.is_empty());
+        assert_eq!(report.uploaded, 0);
+        assert_eq!(report.downloaded, 0);
+        assert_eq!(report.deleted_remote, 0);
+        assert_eq!(report.trashed, 0);
+        assert_eq!(report.actions(), 0);
+        assert_eq!(report.network_writes, 0);
+        assert!(report.attention.is_none());
         f.assert_converged();
     }
 
