@@ -13,7 +13,7 @@ license=('GPL-3.0-or-later')
 depends=('gtk4' 'glib2' 'glibc' 'gcc-libs' 'dbus')
 optdepends=('gnome-keyring: store the Dropbox sign-in in the desktop keyring')
 makedepends=('cargo')
-options=('!debug')
+options=('!debug' '!lto')  # makepkg's -flto C objects (ring) can't link with rust-lld
 
 build() {
   cd "$startdir/.."
