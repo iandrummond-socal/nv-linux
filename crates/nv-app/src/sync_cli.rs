@@ -4,7 +4,7 @@
 //! dependencies ([`Ctx`]), so the whole flow is testable without the network,
 //! the real keyring or the member's folders. [`run_from_env`] wires the real ones.
 
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -15,7 +15,7 @@ use nv_core::storage::{SystemTrasher, Trasher};
 use nv_core::watcher::is_note_path;
 use nv_sync::dropbox::oauth::{self, Endpoints, Pkce};
 use nv_sync::dropbox::{Account, DropboxRemote};
-use nv_sync::engine::{Engine, EngineOptions, PassReport};
+use nv_sync::engine::{try_lock, Engine, EngineOptions, PassReport};
 use nv_sync::plan::SkipReason;
 use nv_sync::remote::{Remote, RemoteChange, RemoteError, RemoteResult};
 use nv_sync::secret::Secret;
@@ -26,8 +26,6 @@ pub const EXIT_OK: i32 = 0;
 pub const EXIT_ATTENTION: i32 = 1;
 pub const EXIT_USAGE: i32 = 2;
 
-/// The engine's lock file (`engine.rs` `LOCK_FILE`); disconnect takes it too.
-const LOCK_FILE: &str = "sync.lock";
 const CONNECTED_APPS: &str = "https://www.dropbox.com/account/connected_apps";
 
 pub const USAGE: &str = "\
@@ -106,12 +104,8 @@ impl DropboxApi for RealDropbox {
     }
 
     fn exchange(&self, app_key: &str, code: &Secret, verifier: &Secret) -> RemoteResult<Secret> {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(60)))
-            .build()
-            .into();
-        let tokens = oauth::exchange_code(&agent, &self.endpoints, app_key, code, verifier)?;
+        let tokens =
+            oauth::exchange_code(&oauth::agent(), &self.endpoints, app_key, code, verifier)?;
         tokens
             .refresh_token
             .ok_or_else(|| RemoteError::Other("Dropbox did not return a long-lived sign-in".into()))
@@ -575,7 +569,7 @@ fn conflict_copies(notes_dir: &Path) -> usize {
 fn disconnect(ctx: &mut Ctx) -> i32 {
     // Hold the engine's lock so a running app can't rewrite state we remove.
     let _lock = if ctx.state_dir.is_dir() {
-        match try_lock(&ctx.state_dir.join(LOCK_FILE)) {
+        match try_lock(ctx.state_dir) {
             Ok(Some(lock)) => Some(lock),
             Ok(None) => {
                 return ctx.fail(
@@ -636,20 +630,6 @@ fn disconnect(ctx: &mut Ctx) -> i32 {
 }
 
 /// `Ok(None)` when another process holds the lock.
-fn try_lock(path: &Path) -> io::Result<Option<File>> {
-    let file = File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
-    match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
-        Err(fs::TryLockError::WouldBlock) => Ok(None),
-        Err(fs::TryLockError::Error(error)) => Err(error),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
@@ -1171,7 +1151,7 @@ mod tests {
         );
 
         fs::create_dir_all(&env.state).unwrap();
-        let held = try_lock(&env.state.join(LOCK_FILE)).unwrap().unwrap();
+        let held = try_lock(&env.state).unwrap().unwrap();
         let output = env.run(
             &dropbox,
             SyncCommand::Now {
@@ -1253,7 +1233,7 @@ mod tests {
         let env = Env::new();
         env.login();
         fs::create_dir_all(&env.state).unwrap();
-        let held = try_lock(&env.state.join(LOCK_FILE)).unwrap().unwrap();
+        let held = try_lock(&env.state).unwrap().unwrap();
         let output = env.run(&NoNetwork, SyncCommand::Disconnect, "");
         assert_eq!(output.code, 1);
         assert!(output.err.contains("syncing right now"));

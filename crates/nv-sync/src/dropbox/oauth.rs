@@ -9,6 +9,7 @@ use super::{transport, Response};
 use crate::error::{Error, Result};
 use crate::remote::{RemoteError, RemoteResult};
 use crate::secret::Secret;
+use std::time::Duration;
 
 #[derive(Debug)]
 pub struct Pkce {
@@ -59,6 +60,15 @@ fn percent_encode(value: &str) -> String {
         }
     }
     result
+}
+
+/// How long one OAuth request may take in total.
+const TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The canonical agent for the OAuth calls here (statuses are read, not
+/// raised; bounded time), so callers never configure HTTP themselves.
+pub fn agent() -> ureq::Agent {
+    super::agent(TIMEOUT)
 }
 
 pub fn authorize_url(ep: &Endpoints, app_key: &str, challenge: &str) -> String {

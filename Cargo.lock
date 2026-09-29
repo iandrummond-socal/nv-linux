@@ -1542,7 +1542,6 @@ dependencies = [
  "nv-sync",
  "serde_json",
  "tempfile",
- "ureq",
 ]
 
 [[package]]

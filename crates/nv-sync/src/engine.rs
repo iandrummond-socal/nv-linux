@@ -30,6 +30,7 @@ use nv_core::watcher::{is_note_path, FolderWatcher};
 
 /// Rounds per pass: a replanned or retried key gets at most this many tries.
 const MAX_ROUNDS: usize = 3;
+/// The engine's lock file inside the state folder; see [`try_lock`].
 const LOCK_FILE: &str = "sync.lock";
 const LONGPOLL: Duration = Duration::from_secs(90);
 const OFFLINE_MIN: Duration = Duration::from_secs(5);
@@ -110,6 +111,23 @@ pub enum Command {
     SyncNow { allow_deletes: bool },
     Flush(Sender<()>),
     Stop,
+}
+
+/// Take the sync lock for `state_dir` without waiting: `Ok(None)` when
+/// another engine (or anything else holding it) has it. The lock lasts as
+/// long as the returned file. Every writer of the state folder takes this.
+pub fn try_lock(state_dir: &Path) -> io::Result<Option<File>> {
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(state_dir.join(LOCK_FILE))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(fs::TryLockError::WouldBlock) => Ok(None),
+        Err(fs::TryLockError::Error(error)) => Err(error),
+    }
 }
 
 pub struct Engine {
@@ -200,17 +218,7 @@ impl Engine {
             }
         }
         fs::create_dir_all(&opts.state_dir)?;
-        let lock = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(opts.state_dir.join(LOCK_FILE))?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(fs::TryLockError::WouldBlock) => return Err(Error::Locked),
-            Err(fs::TryLockError::Error(error)) => return Err(error.into()),
-        }
+        let lock = try_lock(&opts.state_dir)?.ok_or(Error::Locked)?;
         let state = SyncState::load(&opts.state_dir, &opts.notes_dir, Some(&opts.account_id))?;
         Ok(Engine {
             dir: opts.notes_dir,
