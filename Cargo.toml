@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/nv-core", "crates/nv-app"]
+members = ["crates/nv-core", "crates/nv-sync", "crates/nv-app"]
 resolver = "2"
 
 [workspace.package]

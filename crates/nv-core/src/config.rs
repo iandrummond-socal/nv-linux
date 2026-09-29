@@ -13,6 +13,25 @@ pub enum SortOrder {
     Title,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncConfig {
+    /// Only meaningful once a login exists.
+    pub enabled: bool,
+    pub dropbox_app_key: String,
+    pub debounce_ms: u64,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dropbox_app_key: String::new(),
+            debounce_ms: 2000,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -20,6 +39,12 @@ pub struct Config {
     pub extension: String,
     pub sort: SortOrder,
     pub autosave_ms: u64,
+    #[serde(default)]
+    pub sync: SyncConfig,
+    /// The sync engine refuses to start when false, because a typo in [sync]
+    /// also resets notes_dir to ~/Notes during whole-config fallback.
+    #[serde(skip)]
+    pub loaded_ok: bool,
 }
 
 impl Default for Config {
@@ -31,6 +56,8 @@ impl Default for Config {
             extension: "txt".to_owned(),
             sort: SortOrder::Modified,
             autosave_ms: 500,
+            sync: SyncConfig::default(),
+            loaded_ok: true,
         }
     }
 }
@@ -64,13 +91,14 @@ impl Config {
         let mut config = match fs::read(&path) {
             Ok(bytes) => parse_config(&path, &bytes),
             Err(error) if error.kind() == ErrorKind::NotFound => {
-                let defaults = Self::default();
+                let mut defaults = Self::default();
                 let contents = toml::to_string_pretty(&defaults)
                     .map_err(|error| Error::Config(error.to_string()))?;
                 fs::create_dir_all(config_dir)?;
                 match OpenOptions::new().write(true).create_new(true).open(&path) {
                     Ok(mut file) => {
                         file.write_all(contents.as_bytes())?;
+                        defaults.loaded_ok = true;
                         defaults
                     }
                     // Another loader may have created the file since our read.
@@ -123,15 +151,21 @@ fn real_env(key: &str) -> Option<String> {
 fn parse_config(path: &Path, bytes: &[u8]) -> Config {
     let parsed = std::str::from_utf8(bytes)
         .map_err(|error| error.to_string())
-        .and_then(|contents| toml::from_str(contents).map_err(|error| error.to_string()));
+        .and_then(|contents| toml::from_str::<Config>(contents).map_err(|error| error.to_string()));
     match parsed {
-        Ok(config) => config,
+        Ok(mut config) => {
+            config.loaded_ok = true;
+            config
+        }
         Err(error) => {
             log::warn!(
                 "Invalid configuration {}: {error}; using defaults without overwriting the file",
                 path.display()
             );
-            Config::default()
+            Config {
+                loaded_ok: false,
+                ..Config::default()
+            }
         }
     }
 }
@@ -149,17 +183,24 @@ mod tests {
         assert_eq!(config.extension, "txt");
         assert_eq!(config.sort, SortOrder::Modified);
         assert_eq!(config.autosave_ms, 500);
+        assert_eq!(config.sync, SyncConfig::default());
     }
 
     #[test]
     fn missing_file_is_written_once_and_subsequent_load_reads_it() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("nested/config");
-        assert_defaults(&Config::load_from_env(&dir, &no_env).unwrap());
+        let loaded = Config::load_from_env(&dir, &no_env).unwrap();
+        assert_defaults(&loaded);
+        assert!(loaded.loaded_ok);
         let path = dir.join("config.toml");
         let written = fs::read_to_string(&path).unwrap();
         assert_defaults(&toml::from_str::<Config>(&written).unwrap());
         assert!(written.contains("sort = \"modified\""));
+        assert!(!written.contains("loaded_ok"));
+        let reloaded = Config::load_from_env(&dir, &no_env).unwrap();
+        assert_defaults(&reloaded);
+        assert!(reloaded.loaded_ok);
         let edited = "# preserve this comment\nsort = 'title'\n";
         fs::write(&path, edited).unwrap();
         let loaded = Config::load_from_env(&dir, &no_env).unwrap();
@@ -184,6 +225,12 @@ mod tests {
             extension: "md".to_owned(),
             sort: SortOrder::Title,
             autosave_ms: 1250,
+            sync: SyncConfig {
+                enabled: false,
+                dropbox_app_key: "abc".to_owned(),
+                debounce_ms: 3000,
+            },
+            loaded_ok: true,
         };
         let contents = toml::to_string(&expected).unwrap();
         assert!(contents.contains("\"title\""));
@@ -193,6 +240,8 @@ mod tests {
         assert_eq!(loaded.extension, "md");
         assert_eq!(loaded.sort, SortOrder::Title);
         assert_eq!(loaded.autosave_ms, 1250);
+        assert_eq!(loaded.sync, expected.sync);
+        assert!(loaded.loaded_ok);
     }
 
     #[test]
@@ -207,6 +256,65 @@ mod tests {
     }
 
     #[test]
+    fn file_without_sync_uses_defaults_without_rewriting() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let contents = b"# existing configuration\nnotes_dir = '/x'\n";
+        fs::write(&path, contents).unwrap();
+        let loaded = Config::load_from_env(temp.path(), &no_env).unwrap();
+        assert_eq!(loaded.notes_dir, PathBuf::from("/x"));
+        assert_eq!(loaded.sync, SyncConfig::default());
+        assert!(loaded.loaded_ok);
+        assert_eq!(fs::read(path).unwrap(), contents);
+    }
+
+    #[test]
+    fn full_sync_table_loads_all_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("config.toml"),
+            "[sync]\nenabled = false\ndropbox_app_key = \"abc\"\ndebounce_ms = 3000\n",
+        )
+        .unwrap();
+        let loaded = Config::load_from_env(temp.path(), &no_env).unwrap();
+        assert!(!loaded.sync.enabled);
+        assert_eq!(loaded.sync.dropbox_app_key, "abc");
+        assert_eq!(loaded.sync.debounce_ms, 3000);
+        assert!(loaded.loaded_ok);
+    }
+
+    #[test]
+    fn partial_sync_table_defaults_missing_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("config.toml"),
+            "[sync]\ndropbox_app_key = \"k\"\n",
+        )
+        .unwrap();
+        let loaded = Config::load_from_env(temp.path(), &no_env).unwrap();
+        assert_eq!(
+            loaded.sync,
+            SyncConfig {
+                dropbox_app_key: "k".to_owned(),
+                ..SyncConfig::default()
+            }
+        );
+        assert!(loaded.loaded_ok);
+    }
+
+    #[test]
+    fn malformed_sync_falls_back_to_whole_config_defaults_without_rewriting() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let contents = b"notes_dir = '/x'\n[sync]\ndebounce_ms = 'slow'\n";
+        fs::write(&path, contents).unwrap();
+        let loaded = Config::load_from_env(temp.path(), &no_env).unwrap();
+        assert_defaults(&loaded);
+        assert!(!loaded.loaded_ok);
+        assert_eq!(fs::read(path).unwrap(), contents);
+    }
+
+    #[test]
     fn malformed_files_are_preserved() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("config.toml");
@@ -217,7 +325,9 @@ mod tests {
             &b"\xff\xfe"[..],
         ] {
             fs::write(&path, contents).unwrap();
-            assert_defaults(&Config::load_from_env(temp.path(), &no_env).unwrap());
+            let loaded = Config::load_from_env(temp.path(), &no_env).unwrap();
+            assert_defaults(&loaded);
+            assert!(!loaded.loaded_ok);
             assert_eq!(fs::read(&path).unwrap(), contents);
         }
     }
