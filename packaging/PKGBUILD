@@ -4,12 +4,13 @@
 # Rust is installed. gtk4 is already present. makepkg asks for sudo only at install.
 
 pkgname=nv-linux
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc='Notational Velocity for Omarchy: search-or-create plain-text notes'
 arch=('x86_64')
 license=('GPL-3.0-or-later')
-depends=('gtk4' 'glib2' 'glibc' 'gcc-libs')
+depends=('gtk4' 'glib2' 'glibc' 'gcc-libs' 'dbus')
+optdepends=('gnome-keyring: store the Dropbox sign-in in the desktop keyring')
 makedepends=('cargo')
 options=('!debug')
 
