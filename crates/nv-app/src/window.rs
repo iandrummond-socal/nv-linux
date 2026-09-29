@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -10,9 +11,24 @@ use nv_core::model::NoteId;
 use nv_core::watcher::{FolderWatcher, StoreEvent};
 use nv_core::Error;
 
+use nv_sync::secret::Secret;
+use nv_sync::tokens::{default_store, TokenStore};
+
 use crate::editor::Editor;
 use crate::note_list::{NoteList, RowData};
 use crate::search_field::SearchField;
+use crate::sync_cli::RealDropbox;
+use crate::sync_ui::{
+    finish_in_background, is_conflict_copy, open_in_browser, ConnectFlow, SyncIndicator,
+    SyncService, BROWSER_FALLBACK, CODE_PROMPT,
+};
+
+/// The in-app Dropbox sign-in waiting for its pasted code in the search field.
+struct PendingConnect {
+    flow: ConnectFlow,
+    /// The field's own placeholder, put back when the prompt ends.
+    placeholder: Option<glib::GString>,
+}
 
 pub struct Controller {
     window: gtk::ApplicationWindow,
@@ -26,9 +42,18 @@ pub struct Controller {
     toast_revealer: gtk::Revealer,
     toast_label: gtk::Label,
     toast_timer: RefCell<Option<glib::SourceId>>,
+    sync: Rc<SyncService>,
+    /// Kept alive here: the hub only holds it weakly.
+    _sync_indicator: Rc<SyncIndicator>,
+    connecting: RefCell<Option<PendingConnect>>,
 }
 
-pub fn build_window(app: &gtk::Application, library: Library, config: &Config) -> Rc<Controller> {
+pub fn build_window(
+    app: &gtk::Application,
+    library: Library,
+    config: &Config,
+    sync: &Rc<SyncService>,
+) -> Rc<Controller> {
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title("nv-linux")
@@ -69,6 +94,10 @@ pub fn build_window(app: &gtk::Application, library: Library, config: &Config) -
     toast_revealer.set_transition_type(gtk::RevealerTransitionType::Crossfade);
     toast_revealer.set_child(Some(&toast_label));
     overlay.add_overlay(&toast_revealer);
+    // Hidden unless Dropbox sync is connected and on.
+    let sync_indicator = Rc::new(SyncIndicator::new());
+    sync_indicator.attach(&overlay);
+    sync.hub().attach(&sync_indicator);
     window.set_child(Some(&overlay));
     let (sender, receiver) = std::sync::mpsc::channel();
     let (async_sender, async_receiver) = async_channel::unbounded();
@@ -100,6 +129,9 @@ pub fn build_window(app: &gtk::Application, library: Library, config: &Config) -
         toast_revealer,
         toast_label,
         toast_timer: RefCell::new(None),
+        sync: Rc::clone(sync),
+        _sync_indicator: sync_indicator,
+        connecting: RefCell::new(None),
     });
     let rows: Vec<_> = controller
         .library
@@ -214,6 +246,12 @@ impl Controller {
         self.add_action("restore", |this| this.restore());
         self.add_action("rename", |this| this.begin_rename());
         self.add_action("trash", |this| this.trash());
+        self.add_action("sync-now", |this| {
+            if let Err(message) = this.sync.sync_now() {
+                this.toast(&message);
+            }
+        });
+        self.add_action("sync-connect", |this| this.begin_connect());
         let weak = Rc::downgrade(self);
         self.window.connect_close_request(move |_| {
             if let Some(this) = weak.upgrade() {
@@ -286,6 +324,16 @@ impl Controller {
             }
             Change::Added(id) => {
                 self.update_row(id);
+                // Borrow released before the hub touches any widget.
+                let conflict_copy = self
+                    .library
+                    .borrow()
+                    .get(id)
+                    .map(|note| note.title.clone())
+                    .filter(|title| is_conflict_copy(title));
+                if let Some(title) = conflict_copy {
+                    self.sync.hub().note_conflict_copy(&title);
+                }
                 self.requery();
             }
             Change::Removed(id) => {
@@ -346,6 +394,7 @@ impl Controller {
         let Some(id) = self.list.selected() else {
             return;
         };
+        self.cancel_connect();
         self.save_pending();
         if let Some((title, _, _)) = self.note_content(id) {
             self.renaming.set(Some(id));
@@ -462,6 +511,7 @@ impl Controller {
     }
 
     fn selected(self: &Rc<Self>, id: Option<NoteId>) {
+        self.cancel_connect();
         if self.search.is_rename_mode() && self.renaming.get() != id {
             self.cancel_rename();
         }
@@ -484,6 +534,10 @@ impl Controller {
     }
 
     fn activate_search(self: &Rc<Self>) {
+        if self.connecting.borrow().is_some() {
+            self.finish_connect();
+            return;
+        }
         if self.search.is_rename_mode() {
             self.finish_rename();
             return;
@@ -528,7 +582,12 @@ impl Controller {
     }
 
     fn clear_search(self: &Rc<Self>) {
-        // Escape cancels the temporary rename view without clearing the saved query.
+        // Escape cancels the code prompt or the temporary rename view without
+        // clearing the saved query.
+        if self.connecting.borrow().is_some() {
+            self.cancel_connect();
+            return;
+        }
         if self.search.is_rename_mode() {
             self.cancel_rename();
             return;
@@ -596,6 +655,106 @@ impl Controller {
                 glib::g_warning!("nv-linux", "{}", message);
             }
         }
+    }
+
+    /// Ctrl+Shift+D: open Dropbox's sign-in in the browser and turn the search
+    /// field into a "paste the code" prompt (the rename-mode pattern). The same
+    /// action reconnects after the sign-in expires.
+    fn begin_connect(self: &Rc<Self>) {
+        if self.connecting.borrow().is_some() {
+            self.search.focus_select_all();
+            return;
+        }
+        if self.renaming.get().is_some() {
+            self.cancel_rename();
+        }
+        self.save_pending();
+        // Pick up an app key added to config.toml while the app runs.
+        if let Ok(fresh) = Config::load() {
+            self.sync.refresh_sync_config(&fresh);
+        }
+        let flow = match ConnectFlow::begin(&self.sync.config(), &RealDropbox::new()) {
+            Ok(flow) => flow,
+            Err(error) => {
+                self.toast(&error.message());
+                return;
+            }
+        };
+        if !open_in_browser(flow.url()) {
+            self.window.clipboard().set_text(flow.url());
+            self.toast(BROWSER_FALLBACK);
+        }
+        let entry = self.search.widget();
+        let placeholder = entry.placeholder_text();
+        self.connecting
+            .replace(Some(PendingConnect { flow, placeholder }));
+        self.search.set_rename_mode(true);
+        self.search.set_text_silently("");
+        entry.set_placeholder_text(Some(CODE_PROMPT));
+        // The code is a credential: never shown on screen.
+        entry.set_visibility(false);
+        self.search.focus_select_all();
+    }
+
+    /// End the code prompt and put the search field back as it was.
+    /// Returns the prompt's sign-in attempt, if one was waiting.
+    fn end_connect_prompt(&self) -> Option<ConnectFlow> {
+        let pending = self.connecting.borrow_mut().take()?;
+        let entry = self.search.widget();
+        entry.set_visibility(true);
+        entry.set_placeholder_text(pending.placeholder.as_deref());
+        // Restores the saved query view, which also overwrites the typed code.
+        self.search.set_rename_mode(false);
+        Some(pending.flow)
+    }
+
+    fn cancel_connect(&self) {
+        if self.end_connect_prompt().is_some() {
+            self.search.focus_select_all();
+        }
+    }
+
+    /// Enter in the code prompt: exchange the code off the main thread, then
+    /// start (or restart) the engine through the app's one sync service.
+    fn finish_connect(self: &Rc<Self>) {
+        let code = Secret::new(self.search.text());
+        let Some(flow) = self.end_connect_prompt() else {
+            return;
+        };
+        self.search.focus_select_all();
+        let Some(state_dir) = self.sync.state_dir().map(Path::to_path_buf) else {
+            self.toast("Couldn't find a state folder for the sign-in (set NV_STATE_DIR)");
+            return;
+        };
+        self.toast("Connecting to Dropbox…");
+        let result = finish_in_background(flow, code, Box::new(RealDropbox::new()), move || {
+            Box::new(default_store(&state_dir)) as Box<dyn TokenStore>
+        });
+        let weak = Rc::downgrade(self);
+        let sync = Rc::downgrade(&self.sync);
+        glib::spawn_future_local(async move {
+            let Ok(result) = result.recv().await else {
+                return;
+            };
+            let message = match result {
+                Ok(connected) => {
+                    let mut message = format!("Connected to Dropbox as {}", connected.who);
+                    if let Some(sync) = sync.upgrade() {
+                        if !sync.config().sync.enabled {
+                            message
+                                .push_str("; sync is off in config.toml ([sync] enabled = false)");
+                        }
+                        // Stops an engine left from an expired sign-in first.
+                        sync.start();
+                    }
+                    message
+                }
+                Err(error) => error.message(),
+            };
+            if let Some(this) = weak.upgrade() {
+                this.toast(&message);
+            }
+        });
     }
 
     fn toast(self: &Rc<Self>, text: &str) {

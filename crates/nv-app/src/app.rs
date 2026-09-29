@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::rc::Rc;
 
 use gtk::prelude::*;
@@ -6,6 +6,11 @@ use gtk::{gio, glib};
 use nv_core::config::Config;
 use nv_core::library::Library;
 use nv_core::storage::{NoteStore, SystemTrasher};
+
+use crate::sync_ui::SyncService;
+
+/// One sync service per app, made on the first successful launch.
+type SharedSync = Rc<OnceCell<Rc<SyncService>>>;
 
 pub fn run() -> glib::ExitCode {
     let development = std::env::var("NV_DEV").is_ok_and(|value| value == "1");
@@ -26,7 +31,9 @@ pub fn run() -> glib::ExitCode {
         .build();
     // The run scope owns controllers; all signal callbacks hold only weak references.
     let controllers = Rc::new(RefCell::new(Vec::<Rc<crate::window::Controller>>::new()));
+    let sync: SharedSync = Rc::new(OnceCell::new());
     let weak = Rc::downgrade(&controllers);
+    let activate_sync = Rc::clone(&sync);
     app.connect_activate(move |app| {
         if let Some(window) = app
             .active_window()
@@ -42,7 +49,16 @@ pub fn run() -> glib::ExitCode {
         match load_library() {
             Ok((library, config)) => {
                 crate::theming::install(&config);
-                let controller = crate::window::build_window(app, library, &config);
+                // Started once per app, not per window. Without a Dropbox
+                // sign-in (or with sync off) this starts no thread at all.
+                let sync = activate_sync
+                    .get_or_init(|| {
+                        let sync = SyncService::new(&config);
+                        sync.start();
+                        sync
+                    })
+                    .clone();
+                let controller = crate::window::build_window(app, library, &config, &sync);
                 let window = controller.window().clone();
                 controllers.borrow_mut().push(controller);
                 window.present();
@@ -74,7 +90,8 @@ pub fn run() -> glib::ExitCode {
                 .retain(|controller| controller.window().upcast_ref::<gtk::Window>() != window);
         }
     });
-    app.connect_startup(|app| {
+    let startup_sync = Rc::clone(&sync);
+    app.connect_startup(move |app| {
         app.set_accels_for_action("win.clear-search", &["Escape"]);
         app.set_accels_for_action("win.focus-search", &["<Control>l"]);
         app.set_accels_for_action("win.next-note", &["<Control>j"]);
@@ -82,18 +99,22 @@ pub fn run() -> glib::ExitCode {
         app.set_accels_for_action("win.restore", &["<Control>s"]);
         app.set_accels_for_action("win.rename", &["<Control>r"]);
         app.set_accels_for_action("win.trash", &["<Control><Shift>Delete"]);
+        app.set_accels_for_action("win.sync-now", &["<Control><Shift>y"]);
+        app.set_accels_for_action("win.sync-connect", &["<Control><Shift>d"]);
         app.set_accels_for_action("app.quit", &["<Control>q"]);
         let quit = gio::SimpleAction::new("quit", None);
         let weak = app.downgrade();
+        let quit_sync = Rc::clone(&startup_sync);
         quit.connect_activate(move |_, _| {
             if let Some(app) = weak.upgrade() {
-                flush_windows(&app);
+                flush_windows(&app, &quit_sync);
                 app.quit();
             }
         });
         app.add_action(&quit);
     });
-    app.connect_shutdown(flush_windows);
+    let shutdown_sync = Rc::clone(&sync);
+    app.connect_shutdown(move |app| flush_windows(app, &shutdown_sync));
     let exit_code = app.run();
     drop(controllers);
     exit_code
@@ -110,8 +131,12 @@ fn load_library() -> nv_core::Result<(Library, Config)> {
     Ok((Library::new(store, config.sort), config))
 }
 
-fn flush_windows(app: &gtk::Application) {
+/// Save every window's pending edit, then give sync one last pass (≤ 5 s) and stop it.
+fn flush_windows(app: &gtk::Application, sync: &SharedSync) {
     for window in app.windows() {
         let _ = WidgetExt::activate_action(&window, "win.flush", None);
+    }
+    if let Some(sync) = sync.get() {
+        sync.shutdown();
     }
 }

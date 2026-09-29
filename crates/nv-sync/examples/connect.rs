@@ -1,9 +1,8 @@
 use std::io::{self, Write};
 use std::process::{Command, ExitCode, Stdio};
-use std::time::Duration;
 
 use nv_core::config::Config;
-use nv_sync::dropbox::oauth::{authorize_url, exchange_code, Pkce};
+use nv_sync::dropbox::oauth::{agent, authorize_url, exchange_code, Pkce};
 use nv_sync::dropbox::{DropboxRemote, Endpoints};
 use nv_sync::secret::Secret;
 use nv_sync::state::state_dir_with;
@@ -32,12 +31,7 @@ fn connect() -> Result<(), Box<dyn std::error::Error>> {
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
     let code = Secret::new(line);
-    let agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .timeout_global(Some(Duration::from_secs(60)))
-        .build()
-        .into();
-    let tokens = exchange_code(&agent, &endpoints, &app_key, &code, &pkce.verifier)?;
+    let tokens = exchange_code(&agent(), &endpoints, &app_key, &code, &pkce.verifier)?;
     let refresh_token = tokens
         .refresh_token
         .ok_or("Dropbox did not return a refresh token")?;

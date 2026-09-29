@@ -9,24 +9,28 @@
 //! thread. [`status_channel`] bridges that onto an `async_channel`, and
 //! [`StatusHub::run`] drains it with `glib::spawn_future_local`, so labels are
 //! only ever touched on the GTK main context — never from the worker.
-// The window/app task wires these in; until then nothing calls them.
-#![allow(dead_code)]
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::mpsc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use gtk::prelude::*;
 use gtk::{gio, glib};
 use nv_core::config::Config;
+use nv_core::storage::{SystemTrasher, Trasher};
 use nv_sync::dropbox::oauth::Pkce;
-use nv_sync::engine::SyncStatus;
-use nv_sync::remote::RemoteError;
+use nv_sync::dropbox::DropboxNotifier;
+use nv_sync::engine::{Engine, EngineHandle, SyncStatus};
+use nv_sync::remote::{Notifier, RemoteError};
 use nv_sync::secret::Secret;
-use nv_sync::tokens::{StoredLogin, TokenStore};
+use nv_sync::state::state_dir_with;
+use nv_sync::tokens::{default_store, StoredLogin, TokenStore};
 
-use crate::sync_cli::DropboxApi;
+use crate::sync_cli::{engine_options, error_message, DropboxApi, RealDropbox};
 
 /// Longest attention message shown in the indicator before it is cut with `…`.
 const ATTENTION_CHARS: usize = 40;
@@ -125,7 +129,7 @@ fn shorten(message: &str) -> String {
 }
 
 /// True for a note title the library made as a conflict copy (`name (conflict …)`).
-/// The window counts these as they appear to feed [`StatusHub::add_conflicts`].
+/// The window reports these as they appear to [`StatusHub::note_conflict_copy`].
 pub fn is_conflict_copy(title: &str) -> bool {
     title.contains(" (conflict ")
 }
@@ -198,10 +202,6 @@ impl SyncIndicator {
         overlay.add_overlay(&self.label);
     }
 
-    pub fn widget(&self) -> &gtk::Label {
-        &self.label
-    }
-
     /// Render one status. Call on the GTK main thread only.
     pub fn set_status(&self, status: &SyncStatus, conflicts: usize) {
         match status_text(status, conflicts, Utc::now()) {
@@ -220,12 +220,13 @@ impl SyncIndicator {
 // Fan-out to every window
 // ---------------------------------------------------------------------------
 
-/// One per app: remembers the last status and the session's conflict count,
+/// One per app: remembers the last status and the session's conflict copies,
 /// pushes them to every attached window's indicator, and re-renders every
 /// 30 s so "synced Nm ago" stays true. Main thread only (`Rc`).
 pub struct StatusHub {
     status: RefCell<SyncStatus>,
-    conflicts: Cell<usize>,
+    /// Titles, not a counter: every window's watcher sees the same new copy.
+    conflict_copies: RefCell<HashSet<String>>,
     indicators: RefCell<Vec<Weak<SyncIndicator>>>,
 }
 
@@ -233,7 +234,7 @@ impl StatusHub {
     pub fn new() -> Rc<Self> {
         let hub = Rc::new(Self {
             status: RefCell::new(SyncStatus::Off),
-            conflicts: Cell::new(0),
+            conflict_copies: RefCell::new(HashSet::new()),
             indicators: RefCell::new(Vec::new()),
         });
         let weak = Rc::downgrade(&hub);
@@ -252,7 +253,7 @@ impl StatusHub {
     /// Register a window's indicator; it shows the current status at once.
     /// The hub holds it weakly, so a closed window simply drops out.
     pub fn attach(&self, indicator: &Rc<SyncIndicator>) {
-        indicator.set_status(&self.status.borrow(), self.conflicts.get());
+        indicator.set_status(&self.status(), self.conflicts());
         self.indicators.borrow_mut().push(Rc::downgrade(indicator));
     }
 
@@ -274,19 +275,30 @@ impl StatusHub {
         self.render();
     }
 
-    pub fn add_conflicts(&self, n: usize) {
-        self.conflicts.set(self.conflicts.get() + n);
-        self.render();
+    /// A conflict copy appeared in the notes folder. Counted once per title,
+    /// and only while sync is on (a member without sync never sees a count).
+    pub fn note_conflict_copy(&self, title: &str) {
+        if self.status() == SyncStatus::Off {
+            return;
+        }
+        let added = self.conflict_copies.borrow_mut().insert(title.to_owned());
+        if added {
+            self.render();
+        }
     }
 
     pub fn status(&self) -> SyncStatus {
         self.status.borrow().clone()
     }
 
+    fn conflicts(&self) -> usize {
+        self.conflict_copies.borrow().len()
+    }
+
     fn render(&self) {
         // Clone out first: widget calls must not run under our own borrows.
-        let status = self.status.borrow().clone();
-        let conflicts = self.conflicts.get();
+        let status = self.status();
+        let conflicts = self.conflicts();
         let live: Vec<Rc<SyncIndicator>> = {
             let mut indicators = self.indicators.borrow_mut();
             indicators.retain(|weak| weak.strong_count() > 0);
@@ -294,6 +306,280 @@ impl StatusHub {
         };
         for indicator in live {
             indicator.set_status(&status, conflicts);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Starting the engine (once per app)
+// ---------------------------------------------------------------------------
+
+/// How long quitting waits for a last pass before it lets go.
+pub const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Why sync stays off. None of these shows an indicator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffReason {
+    InvalidConfig,
+    Disabled,
+    NoAppKey,
+    NotConnected,
+}
+
+/// Cheap and offline, and it never touches the keyring: may this app sync at
+/// all? A member who never set Dropbox up stops here.
+pub fn sync_gate(config: &Config) -> Result<(), OffReason> {
+    if !config.loaded_ok {
+        Err(OffReason::InvalidConfig)
+    } else if !config.sync.enabled {
+        Err(OffReason::Disabled)
+    } else if config.sync.dropbox_app_key.trim().is_empty() {
+        Err(OffReason::NoAppKey)
+    } else {
+        Ok(())
+    }
+}
+
+/// What one start attempt came to.
+pub enum StartOutcome {
+    Started(EngineHandle),
+    Off(OffReason),
+    /// Another syncer holds the lock and is doing the job: show nothing.
+    Locked,
+    /// Connected, but the engine refused to start: shown in the indicator.
+    Failed(String),
+}
+
+/// Everything one start needs: the real things in production
+/// ([`StartDeps::production`]), fakes in tests.
+pub struct StartDeps {
+    pub config: Config,
+    pub state_dir: PathBuf,
+    pub store: Box<dyn TokenStore>,
+    pub dropbox: Box<dyn DropboxApi + Send>,
+    pub notifier: Box<dyn Notifier>,
+    pub trasher: Box<dyn Trasher + Send>,
+    /// Home folder for the engine's Dropbox-client guard; `None` = the real one.
+    pub home_dir: Option<PathBuf>,
+}
+
+impl StartDeps {
+    /// The real Dropbox, sign-in store and Trash. Building the store probes
+    /// the keyring, which can block: call it off the GTK main thread.
+    pub fn production(config: Config, state_dir: PathBuf) -> Self {
+        let store = default_store(&state_dir);
+        Self {
+            config,
+            state_dir,
+            store: Box::new(store),
+            dropbox: Box::new(RealDropbox::new()),
+            notifier: Box::new(DropboxNotifier::new()),
+            trasher: Box::new(SystemTrasher),
+            home_dir: None,
+        }
+    }
+}
+
+/// Read the sign-in and start the engine thread (its first pass runs at once).
+/// Blocking (keyring, state file): run it off the GTK main thread.
+pub fn start_engine(deps: StartDeps, status: mpsc::Sender<SyncStatus>) -> StartOutcome {
+    if let Err(reason) = sync_gate(&deps.config) {
+        return StartOutcome::Off(reason);
+    }
+    let login = match deps.store.load() {
+        Ok(Some(login)) => login,
+        Ok(None) => return StartOutcome::Off(OffReason::NotConnected),
+        Err(error) => {
+            return StartOutcome::Failed(format!("couldn't read the Dropbox sign-in: {error}"))
+        }
+    };
+    let options = engine_options(&deps.config, &deps.state_dir, &login, deps.home_dir);
+    let remote = deps.dropbox.remote(
+        deps.config.sync.dropbox_app_key.trim(),
+        &login.refresh_token,
+    );
+    match Engine::new(options, remote, deps.trasher) {
+        Ok(engine) => {
+            let debounce = engine.debounce();
+            StartOutcome::Started(nv_sync::engine::spawn(
+                engine,
+                deps.notifier,
+                status,
+                debounce,
+            ))
+        }
+        Err(nv_sync::Error::Locked) => StartOutcome::Locked,
+        Err(error) => StartOutcome::Failed(error_message(&error)),
+    }
+}
+
+/// Where the app's engine stands, for the Ctrl+Shift+Y answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineState {
+    NotStarted,
+    Starting,
+    Running,
+    Off(OffReason),
+    Locked,
+    Failed(String),
+}
+
+/// What Ctrl+Shift+Y says when there is no engine to ask.
+pub fn sync_now_refusal(state: &EngineState) -> String {
+    match state {
+        EngineState::NotStarted
+        | EngineState::Off(OffReason::NotConnected | OffReason::NoAppKey) => {
+            "Not connected to Dropbox — Ctrl+Shift+D connects".into()
+        }
+        EngineState::Off(OffReason::Disabled) => {
+            "Sync is off in config.toml ([sync] enabled = false)".into()
+        }
+        EngineState::Off(OffReason::InvalidConfig) => {
+            "config.toml has a mistake, so sync is paused".into()
+        }
+        EngineState::Starting | EngineState::Running => "Sync is starting".into(),
+        EngineState::Locked => "Another nv-linux is already syncing these notes".into(),
+        EngineState::Failed(message) => format!("Sync couldn't start: {message}"),
+    }
+}
+
+/// One per app, main thread only: owns the engine handle and the status hub.
+/// A member who can't sync gets no thread, no indicator and no network.
+pub struct SyncService {
+    hub: Rc<StatusHub>,
+    config: RefCell<Config>,
+    state_dir: Option<PathBuf>,
+    handle: RefCell<Option<EngineHandle>>,
+    state: RefCell<EngineState>,
+    restart_pending: Cell<bool>,
+}
+
+impl SyncService {
+    pub fn new(config: &Config) -> Rc<Self> {
+        Rc::new(Self {
+            hub: StatusHub::new(),
+            config: RefCell::new(config.clone()),
+            state_dir: state_dir_with(&|key| std::env::var(key).ok()),
+            handle: RefCell::new(None),
+            state: RefCell::new(EngineState::NotStarted),
+            restart_pending: Cell::new(false),
+        })
+    }
+
+    pub fn hub(&self) -> &Rc<StatusHub> {
+        &self.hub
+    }
+
+    pub fn config(&self) -> Config {
+        self.config.borrow().clone()
+    }
+
+    /// Take a freshly loaded config's `[sync]` section (e.g. an app key added
+    /// while the app runs). The notes folder stays the one the windows show.
+    pub fn refresh_sync_config(&self, fresh: &Config) {
+        if fresh.loaded_ok {
+            self.config.borrow_mut().sync = fresh.sync.clone();
+        }
+    }
+
+    pub fn state_dir(&self) -> Option<&Path> {
+        self.state_dir.as_deref()
+    }
+
+    /// Start the engine, or restart it (a reconnect): the old engine is
+    /// stopped before the new one takes the lock. The keyring read and the
+    /// engine start run on a worker thread; the result lands on the main context.
+    pub fn start(self: &Rc<Self>) {
+        if *self.state.borrow() == EngineState::Starting {
+            self.restart_pending.set(true);
+            return;
+        }
+        let previous = self.handle.borrow_mut().take();
+        let config = self.config();
+        if let Err(reason) = sync_gate(&config) {
+            drop(previous);
+            self.finish_start(StartOutcome::Off(reason));
+            return;
+        }
+        let Some(state_dir) = self.state_dir.clone() else {
+            drop(previous);
+            self.finish_start(StartOutcome::Failed(
+                "can't find a state folder (set NV_STATE_DIR)".into(),
+            ));
+            return;
+        };
+        self.state.replace(EngineState::Starting);
+        let (status_tx, status_rx) = status_channel();
+        self.hub.run(status_rx);
+        let (result_tx, result_rx) = async_channel::bounded(1);
+        let spawned = std::thread::Builder::new()
+            .name("nv-sync-start".into())
+            .spawn(move || {
+                if let Some(previous) = previous {
+                    previous.stop();
+                }
+                let outcome = start_engine(StartDeps::production(config, state_dir), status_tx);
+                let _ = result_tx.send_blocking(outcome);
+            });
+        if let Err(error) = spawned {
+            self.finish_start(StartOutcome::Failed(format!("sync didn't start: {error}")));
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let outcome = result_rx
+                .recv()
+                .await
+                .unwrap_or_else(|_| StartOutcome::Failed("sync didn't start".into()));
+            if let Some(this) = weak.upgrade() {
+                this.finish_start(outcome);
+            }
+        });
+    }
+
+    fn finish_start(self: &Rc<Self>, outcome: StartOutcome) {
+        let (state, status) = match outcome {
+            StartOutcome::Started(handle) => {
+                self.handle.replace(Some(handle));
+                // The engine reports its own statuses from here on.
+                (EngineState::Running, None)
+            }
+            StartOutcome::Off(reason) => (EngineState::Off(reason), Some(SyncStatus::Off)),
+            StartOutcome::Locked => (EngineState::Locked, Some(SyncStatus::Off)),
+            StartOutcome::Failed(message) => (
+                EngineState::Failed(message.clone()),
+                Some(SyncStatus::Attention(message)),
+            ),
+        };
+        self.state.replace(state);
+        if let Some(status) = status {
+            self.hub.set_status(status);
+        }
+        if self.restart_pending.replace(false) {
+            self.start();
+        }
+    }
+
+    /// Ask for a pass now; `Err` is the toast when there's no engine.
+    pub fn sync_now(&self) -> Result<(), String> {
+        match self.handle.borrow().as_ref() {
+            Some(handle) => {
+                handle.sync_now(false);
+                Ok(())
+            }
+            None => Err(sync_now_refusal(&self.state.borrow())),
+        }
+    }
+
+    /// On quit: one last pass (≤ [`FLUSH_TIMEOUT`]), then stop. A pass still
+    /// running past the timeout is told to stop and not waited on.
+    pub fn shutdown(&self) {
+        self.restart_pending.set(false);
+        let handle = self.handle.borrow_mut().take();
+        if let Some(handle) = handle {
+            if handle.flush(FLUSH_TIMEOUT) {
+                handle.stop();
+            }
         }
     }
 }
@@ -351,7 +637,6 @@ fn remote_error(error: RemoteError) -> ConnectError {
 pub struct Connected {
     /// The account email (or id) for the "Connected as …" toast.
     pub who: String,
-    pub login: StoredLogin,
 }
 
 /// One sign-in attempt: [`ConnectFlow::begin`] makes the authorize URL and
@@ -431,17 +716,18 @@ impl ConnectFlow {
             .email
             .clone()
             .unwrap_or_else(|| login.account_id.clone());
-        Ok(Connected { who, login })
+        Ok(Connected { who })
     }
 }
 
 /// Run [`ConnectFlow::finish`] on a worker thread; await the single result on
 /// the main context with `glib::spawn_future_local(async move { rx.recv().await })`.
+/// `store` is built on that thread too: opening the keyring can block.
 pub fn finish_in_background(
     flow: ConnectFlow,
     code: Secret,
     api: Box<dyn DropboxApi + Send>,
-    store: Box<dyn TokenStore>,
+    store: impl FnOnce() -> Box<dyn TokenStore> + Send + 'static,
 ) -> async_channel::Receiver<Result<Connected, ConnectError>> {
     let (tx, rx) = async_channel::bounded(1);
     let spawned = std::thread::Builder::new()
@@ -449,6 +735,7 @@ pub fn finish_in_background(
         .spawn({
             let tx = tx.clone();
             move || {
+                let store = store();
                 let result = flow.finish(&code, api.as_ref(), store.as_ref());
                 let _ = tx.send_blocking(result);
             }
@@ -767,13 +1054,13 @@ mod tests {
             .finish(&Secret::new(format!("  {CODE}\n")), &api, &store)
             .unwrap();
         assert_eq!(connected.who, "member@example.com");
-        assert_eq!(connected.login.account_id, "dbid:test");
         let calls = api.calls.lock().unwrap();
         assert_eq!(calls.codes, vec![CODE.to_owned()]);
         assert_eq!(calls.verifiers, vec![verifier]);
         let saved = store.load().unwrap().unwrap();
         assert_eq!(saved.refresh_token.expose(), REFRESH);
         assert_eq!(saved.email.as_deref(), Some("member@example.com"));
+        assert_eq!(saved.account_id, "dbid:test");
         assert!(!format!("{connected:?}").contains(REFRESH));
     }
 
@@ -864,16 +1151,287 @@ mod tests {
         let api = FakeDropbox::default();
         let store = MemoryStore::default();
         let flow = ConnectFlow::begin(&config(), &api).unwrap();
-        let rx = finish_in_background(
-            flow,
-            Secret::new(CODE),
-            Box::new(api.clone()),
-            Box::new(store.clone()),
-        );
+        let rx = finish_in_background(flow, Secret::new(CODE), Box::new(api.clone()), {
+            let store = store.clone();
+            move || Box::new(store) as Box<dyn TokenStore>
+        });
         let connected = rx.recv_blocking().unwrap().unwrap();
         assert_eq!(connected.who, "member@example.com");
         assert!(store.load().unwrap().is_some());
         // Exactly one result, then the channel closes.
         assert!(rx.recv_blocking().is_err());
+    }
+
+    // --- starting the engine, with fakes ---------------------------------
+
+    /// Proves the keyring was never read.
+    struct UntouchedStore;
+
+    impl TokenStore for UntouchedStore {
+        fn load(&self) -> nv_sync::Result<Option<StoredLogin>> {
+            panic!("the sign-in store must not be read")
+        }
+        fn save(&self, _: &StoredLogin) -> nv_sync::Result<()> {
+            panic!("save called")
+        }
+        fn clear(&self) -> nv_sync::Result<()> {
+            panic!("clear called")
+        }
+        fn describe(&self) -> &'static str {
+            "untouched"
+        }
+    }
+
+    /// Dropbox stood in by `FakeRemote`; panics if asked for more than a remote.
+    #[derive(Clone)]
+    struct EngineDropbox(Option<nv_sync::fake::SharedFake>);
+
+    impl DropboxApi for EngineDropbox {
+        fn authorize_url(&self, _: &str, _: &str) -> String {
+            panic!("authorize_url called")
+        }
+        fn exchange(&self, _: &str, _: &Secret, _: &Secret) -> RemoteResult<Secret> {
+            panic!("exchange called")
+        }
+        fn account(&self, _: &str, _: &Secret) -> RemoteResult<Account> {
+            panic!("account called")
+        }
+        fn remote(&self, app_key: &str, refresh: &Secret) -> Box<dyn Remote> {
+            assert_eq!(app_key, "test-app-key");
+            assert_eq!(refresh.expose(), REFRESH);
+            match &self.0 {
+                Some(fake) => Box::new(fake.clone()),
+                None => panic!("no engine was expected: remote built"),
+            }
+        }
+        fn revoke(&self, _: &str, _: &Secret) -> RemoteResult<()> {
+            panic!("revoke called")
+        }
+    }
+
+    struct StartEnv {
+        _tmp: tempfile::TempDir,
+        notes: std::path::PathBuf,
+        state: std::path::PathBuf,
+        home: std::path::PathBuf,
+        trash: std::path::PathBuf,
+    }
+
+    impl StartEnv {
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().to_path_buf();
+            let env = Self {
+                notes: root.join("notes"),
+                state: root.join("state"),
+                home: root.join("home"),
+                trash: root.join("trash"),
+                _tmp: tmp,
+            };
+            for dir in [&env.notes, &env.state, &env.home, &env.trash] {
+                std::fs::create_dir_all(dir).unwrap();
+            }
+            env
+        }
+
+        fn config(&self) -> Config {
+            let mut config = config();
+            config.notes_dir = self.notes.clone();
+            config
+        }
+
+        fn deps(
+            &self,
+            config: Config,
+            store: Box<dyn TokenStore>,
+            dropbox: EngineDropbox,
+        ) -> StartDeps {
+            let notifier = nv_sync::fake::SharedFake::new(nv_sync::fake::FakeRemote::new());
+            StartDeps {
+                config,
+                state_dir: self.state.clone(),
+                store,
+                dropbox: Box::new(dropbox),
+                notifier: Box::new(notifier),
+                trasher: Box::new(nv_core::storage::FakeTrasher {
+                    dir: self.trash.clone(),
+                }),
+                home_dir: Some(self.home.clone()),
+            }
+        }
+
+        fn connected_store() -> Box<dyn TokenStore> {
+            let store = MemoryStore::default();
+            *store.saved.lock().unwrap() = Some((
+                REFRESH.to_owned(),
+                "dbid:test".to_owned(),
+                Some("member@example.com".to_owned()),
+            ));
+            Box::new(store)
+        }
+    }
+
+    fn outcome_name(outcome: &StartOutcome) -> String {
+        match outcome {
+            StartOutcome::Started(_) => "Started".into(),
+            StartOutcome::Off(reason) => format!("Off({reason:?})"),
+            StartOutcome::Locked => "Locked".into(),
+            StartOutcome::Failed(message) => format!("Failed({message})"),
+        }
+    }
+
+    #[test]
+    fn sync_ui_gate_needs_valid_config_enabled_and_app_key() {
+        assert_eq!(sync_gate(&config()), Ok(()));
+        let mut broken = config();
+        broken.loaded_ok = false;
+        assert_eq!(sync_gate(&broken), Err(OffReason::InvalidConfig));
+        let mut off = config();
+        off.sync.enabled = false;
+        assert_eq!(sync_gate(&off), Err(OffReason::Disabled));
+        // A member who never set Dropbox up: the default config.
+        assert_eq!(sync_gate(&Config::default()), Err(OffReason::NoAppKey));
+    }
+
+    #[test]
+    fn sync_ui_start_stays_off_without_touching_the_keyring() {
+        let env = StartEnv::new();
+        let mut broken = env.config();
+        broken.loaded_ok = false;
+        let mut disabled = env.config();
+        disabled.sync.enabled = false;
+        let mut never_set_up = env.config();
+        never_set_up.sync.dropbox_app_key = String::new();
+        for (config, want) in [
+            (broken, OffReason::InvalidConfig),
+            (disabled, OffReason::Disabled),
+            (never_set_up, OffReason::NoAppKey),
+        ] {
+            let (tx, rx) = mpsc::channel();
+            let outcome = start_engine(
+                env.deps(config, Box::new(UntouchedStore), EngineDropbox(None)),
+                tx,
+            );
+            assert_eq!(outcome_name(&outcome), format!("Off({want:?})"));
+            // No engine: the status sender is gone and nothing was reported.
+            assert!(rx.recv().is_err());
+        }
+    }
+
+    #[test]
+    fn sync_ui_start_without_a_login_starts_nothing() {
+        let env = StartEnv::new();
+        let (tx, rx) = mpsc::channel();
+        let outcome = start_engine(
+            env.deps(
+                env.config(),
+                Box::new(MemoryStore::default()),
+                EngineDropbox(None),
+            ),
+            tx,
+        );
+        assert_eq!(outcome_name(&outcome), "Off(NotConnected)");
+        assert!(rx.recv().is_err());
+    }
+
+    #[test]
+    fn sync_ui_start_is_silent_when_another_syncer_holds_the_lock() {
+        let env = StartEnv::new();
+        let _held = nv_sync::engine::try_lock(&env.state).unwrap().unwrap();
+        let fake = nv_sync::fake::SharedFake::new(nv_sync::fake::FakeRemote::new());
+        let (tx, rx) = mpsc::channel();
+        let outcome = start_engine(
+            env.deps(
+                env.config(),
+                StartEnv::connected_store(),
+                EngineDropbox(Some(fake)),
+            ),
+            tx,
+        );
+        assert_eq!(outcome_name(&outcome), "Locked");
+        assert!(rx.recv().is_err());
+        assert_eq!(
+            sync_now_refusal(&EngineState::Locked),
+            "Another nv-linux is already syncing these notes"
+        );
+    }
+
+    #[test]
+    fn sync_ui_start_reports_why_it_could_not_start() {
+        let env = StartEnv::new();
+        let mut config = env.config();
+        config.notes_dir = env.notes.join("missing");
+        let fake = nv_sync::fake::SharedFake::new(nv_sync::fake::FakeRemote::new());
+        let (tx, _rx) = mpsc::channel();
+        let outcome = start_engine(
+            env.deps(
+                config,
+                StartEnv::connected_store(),
+                EngineDropbox(Some(fake)),
+            ),
+            tx,
+        );
+        let name = outcome_name(&outcome);
+        assert!(
+            name.starts_with("Failed(") && name.contains("notes folder"),
+            "{name}"
+        );
+        assert!(!name.contains(REFRESH));
+    }
+
+    #[test]
+    fn sync_ui_start_runs_the_first_pass_and_flushes() {
+        let env = StartEnv::new();
+        std::fs::write(env.notes.join("hello.txt"), "hi").unwrap();
+        let fake = nv_sync::fake::SharedFake::new(nv_sync::fake::FakeRemote::with_hasher(
+            nv_sync::content_hash::content_hash,
+        ));
+        let (tx, rx) = mpsc::channel();
+        let outcome = start_engine(
+            env.deps(
+                env.config(),
+                StartEnv::connected_store(),
+                EngineDropbox(Some(fake.clone())),
+            ),
+            tx,
+        );
+        let StartOutcome::Started(handle) = outcome else {
+            panic!("expected Started, got {}", outcome_name(&outcome));
+        };
+        assert!(handle.flush(Duration::from_secs(10)), "flush timed out");
+        assert!(fake.with(|remote| remote.file("hello.txt").is_some()));
+        handle.stop();
+        let statuses: Vec<SyncStatus> = rx.try_iter().collect();
+        assert_eq!(statuses.first(), Some(&SyncStatus::Starting));
+        assert!(
+            statuses
+                .iter()
+                .any(|status| matches!(status, SyncStatus::Idle { .. })),
+            "{statuses:?}"
+        );
+        // The lock is free again once the engine stopped.
+        assert!(nv_sync::engine::try_lock(&env.state).unwrap().is_some());
+    }
+
+    #[test]
+    fn sync_ui_sync_now_refusals_point_somewhere() {
+        for state in [
+            EngineState::NotStarted,
+            EngineState::Off(OffReason::NotConnected),
+            EngineState::Off(OffReason::NoAppKey),
+        ] {
+            assert_eq!(
+                sync_now_refusal(&state),
+                "Not connected to Dropbox — Ctrl+Shift+D connects"
+            );
+        }
+        assert!(sync_now_refusal(&EngineState::Off(OffReason::Disabled)).contains("enabled"));
+        assert!(
+            sync_now_refusal(&EngineState::Off(OffReason::InvalidConfig)).contains("config.toml")
+        );
+        assert_eq!(
+            sync_now_refusal(&EngineState::Failed("notes folder is missing".into())),
+            "Sync couldn't start: notes folder is missing"
+        );
     }
 }

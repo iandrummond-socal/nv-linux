@@ -93,9 +93,23 @@ pub trait DropboxApi {
     fn revoke(&self, app_key: &str, refresh: &Secret) -> RemoteResult<()>;
 }
 
-/// The real Dropbox HTTP API.
+/// The real Dropbox HTTP API. Building one is offline; only its calls use the network.
 pub struct RealDropbox {
     endpoints: Endpoints,
+}
+
+impl RealDropbox {
+    pub fn new() -> Self {
+        Self {
+            endpoints: Endpoints::dropbox(),
+        }
+    }
+}
+
+impl Default for RealDropbox {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DropboxApi for RealDropbox {
@@ -186,9 +200,7 @@ pub fn run_from_env(args: &[String]) -> i32 {
         return EXIT_ATTENTION;
     };
     let store = default_store(&state_dir);
-    let dropbox = RealDropbox {
-        endpoints: Endpoints::dropbox(),
-    };
+    let dropbox = RealDropbox::new();
     let stdin = io::stdin();
     let mut input = stdin.lock();
     let mut out = io::stdout();
@@ -349,15 +361,25 @@ fn finish_pass(ctx: &mut Ctx, login: &StoredLogin, allow_deletes: bool) -> i32 {
     }
 }
 
-fn pass(ctx: &Ctx, login: &StoredLogin, allow_deletes: bool) -> Result<PassReport, String> {
-    let options = EngineOptions {
-        notes_dir: ctx.config.notes_dir.clone(),
-        state_dir: ctx.state_dir.to_path_buf(),
+/// The engine's options for this config and login; the CLI and the app share it.
+pub fn engine_options(
+    config: &Config,
+    state_dir: &Path,
+    login: &StoredLogin,
+    home_dir: Option<PathBuf>,
+) -> EngineOptions {
+    EngineOptions {
+        notes_dir: config.notes_dir.clone(),
+        state_dir: state_dir.to_path_buf(),
         account_id: login.account_id.clone(),
-        config_loaded_ok: ctx.config.loaded_ok,
-        home_dir: ctx.home_dir.clone(),
-        debounce: Duration::from_millis(ctx.config.sync.debounce_ms),
-    };
+        config_loaded_ok: config.loaded_ok,
+        home_dir,
+        debounce: Duration::from_millis(config.sync.debounce_ms),
+    }
+}
+
+fn pass(ctx: &Ctx, login: &StoredLogin, allow_deletes: bool) -> Result<PassReport, String> {
+    let options = engine_options(ctx.config, ctx.state_dir, login, ctx.home_dir.clone());
     let remote = ctx.dropbox.remote(ctx.app_key(), &login.refresh_token);
     let mut engine =
         Engine::new(options, remote, (ctx.trasher)()).map_err(|e| error_message(&e))?;
@@ -366,7 +388,7 @@ fn pass(ctx: &Ctx, login: &StoredLogin, allow_deletes: bool) -> Result<PassRepor
         .map_err(|error| error_message(&error))
 }
 
-fn error_message(error: &nv_sync::Error) -> String {
+pub fn error_message(error: &nv_sync::Error) -> String {
     match error {
         nv_sync::Error::Locked => {
             "another nv-linux is already syncing; let it finish (or quit the app), then try again."

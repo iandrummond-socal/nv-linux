@@ -46,7 +46,8 @@ impl Editor {
         text_view.set_left_margin(16);
         text_view.set_right_margin(16);
         text_view.set_top_margin(16);
-        text_view.set_bottom_margin(16);
+        // Room under the last line for the sync indicator pinned bottom-right.
+        text_view.set_bottom_margin(32);
         text_view.set_editable(false);
         text_view.set_cursor_visible(false);
 
