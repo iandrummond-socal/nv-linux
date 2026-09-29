@@ -1537,7 +1537,12 @@ dependencies = [
  "async-channel",
  "chrono",
  "gtk4",
+ "log",
  "nv-core",
+ "nv-sync",
+ "serde_json",
+ "tempfile",
+ "ureq",
 ]
 
 [[package]]
