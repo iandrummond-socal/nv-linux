@@ -82,7 +82,7 @@ A file that isn't valid UTF-8 opens read-only and is never rewritten.
 ## Dropbox sync
 
 Dropbox sync is optional; it keeps your notes folder in step with a private folder in your Dropbox (`Dropbox/Apps/<your app name>/`), so notes follow you between machines.
-Only note files with the configured extension sync; nothing else in the folder does.
+The same note files the app lists sync (.txt, .text, .utf8, .taskpaper, and .md, case-insensitively, excluding dotfiles); nothing else in the folder does.
 
 Create your own Dropbox app once:
 
@@ -135,7 +135,7 @@ To keep them syncing with the app closed, turn on the user service once with `sy
 The app and the service never sync at the same time — whichever starts first syncs, and when the service is syncing, the app's mark says `syncing in background`.
 See what it's doing with `journalctl --user -u nv-linux-sync`.
 Turn it off with `systemctl --user disable --now nv-linux-sync`.
-It picks up a reconnect by itself.
+It picks up a reconnect by itself within a minute, whether you reconnect in the app or with `nv-linux sync connect`.
 
 ## Settings
 

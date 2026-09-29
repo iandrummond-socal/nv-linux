@@ -41,6 +41,11 @@ pub enum Outcome {
 
 /// Read through a single descriptor, rejecting observable in-place writes.
 pub fn read_stable(path: &Path) -> Result<Vec<u8>> {
+    read_stable_with_meta(path).map(|(bytes, _)| bytes)
+}
+
+/// Return stable bytes and their metadata from the same descriptor.
+fn read_stable_with_meta(path: &Path) -> Result<(Vec<u8>, fs::Metadata)> {
     for attempt in 0..5 {
         let mut file = File::open(path)?;
         let before = file.metadata()?;
@@ -54,7 +59,7 @@ pub fn read_stable(path: &Path) -> Result<Vec<u8>> {
             && before.modified()? == after.modified()?
             && after.len() == bytes.len() as u64
         {
-            return Ok(bytes);
+            return Ok((bytes, after));
         }
         if attempt < 4 {
             std::thread::sleep(Duration::from_millis(1));
@@ -159,7 +164,13 @@ fn name(item: &Item) -> Result<&str> {
 }
 
 fn record(item: &Item, ctx: &mut Ctx<'_>, file: &RemoteFile, name: &str) -> Result<()> {
-    let mtime = fs::metadata(ctx.dir.join(name))?.modified()?;
+    let (bytes, metadata) = read_stable_with_meta(&ctx.dir.join(name))?;
+    // A save during the network request must not pair a new mtime with an old hash.
+    let mtime = if content_hash(&bytes) == file.content_hash {
+        metadata.modified()?
+    } else {
+        std::time::UNIX_EPOCH
+    };
     ctx.state.files.insert(
         item.key.clone(),
         Base {
@@ -206,6 +217,29 @@ fn upload(item: &Item, ctx: &mut Ctx<'_>, bytes: &[u8], rev: Option<&str>) -> Re
     }
 }
 
+/// Remove unchanged displaced bytes or preserve them in a conflict copy.
+fn finish_displaced(path: &Path, dir: &Path, local: &LocalFile) -> Result<Outcome> {
+    let bytes = read_stable(path)?;
+    if content_hash(&bytes) == local.hash {
+        fs::remove_file(path)?;
+        return Ok(Outcome::Done);
+    }
+    let now = Local::now();
+    loop {
+        let name = conflict_name(dir, &local.name, now);
+        match fs::hard_link(path, dir.join(&name)) {
+            Ok(()) => {
+                // Make the recovery link durable before unlinking the displaced file.
+                File::open(dir)?.sync_all()?;
+                fs::remove_file(path)?;
+                return Ok(Outcome::ConflictCopy { name });
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 /// Keep ownership of the displaced path outside tempfile's automatic cleanup:
 /// any failure after exchange must leave the user's text recoverable on disk.
 fn replace(temp: NamedTempFile, target: &Path, dir: &Path, local: &LocalFile) -> Result<Outcome> {
@@ -217,42 +251,45 @@ fn replace(temp: NamedTempFile, target: &Path, dir: &Path, local: &LocalFile) ->
         target,
         rustix::fs::RenameFlags::EXCHANGE,
     ) {
-        Ok(()) => {
-            let bytes = read_stable(&tmp)?;
-            if content_hash(&bytes) == local.hash {
-                fs::remove_file(&tmp)?;
-                Ok(Outcome::Done)
-            } else {
-                let now = Local::now();
-                loop {
-                    let name = conflict_name(dir, &local.name, now);
-                    match fs::hard_link(&tmp, dir.join(&name)) {
-                        Ok(()) => {
-                            // Make the recovery link durable before unlinking tmp.
-                            File::open(dir)?.sync_all()?;
-                            fs::remove_file(&tmp)?;
-                            return Ok(Outcome::ConflictCopy { name });
-                        }
-                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                        Err(error) => return Err(error.into()),
-                    }
-                }
-            }
-        }
+        Ok(()) => finish_displaced(&tmp, dir, local),
         Err(error) => {
             // Exchange failed, so tmp still contains only downloaded bytes.
             let result = (|| {
                 if error == rustix::io::Errno::INVAL {
                     static WARN: Once = Once::new();
                     WARN.call_once(|| {
-                        log::warn!("filesystem lacks rename exchange; using checked replacement");
+                        log::warn!(
+                            "filesystem lacks rename exchange; using no-clobber replacement"
+                        );
                     });
-                    if content_hash(&read_stable(target)?) != local.hash {
-                        return Ok(Outcome::Replan);
+                    let aside = temporary(dir, b"")?
+                        .into_temp_path()
+                        .keep()
+                        .map_err(|error| error.error)?;
+                    if let Err(error) = fs::rename(target, &aside) {
+                        fs::remove_file(&aside)?;
+                        return if error.kind() == io::ErrorKind::NotFound {
+                            Ok(Outcome::Replan)
+                        } else {
+                            Err(error.into())
+                        };
                     }
-                    // Equivalent to TempPath::persist: atomically replace the target.
-                    fs::rename(&tmp, target)?;
-                    Ok(Outcome::Done)
+                    // An editor may recreate the target after it was moved aside.
+                    match rustix::fs::renameat_with(
+                        rustix::fs::CWD,
+                        &tmp,
+                        rustix::fs::CWD,
+                        target,
+                        rustix::fs::RenameFlags::NOREPLACE,
+                    ) {
+                        Ok(()) => finish_displaced(&aside, dir, local),
+                        Err(error) if error == rustix::io::Errno::EXIST => {
+                            finish_displaced(&aside, dir, local)?;
+                            Ok(Outcome::Replan)
+                        }
+                        // Keep the displaced text recoverable on any other failure.
+                        Err(error) => Err(io::Error::from(error).into()),
+                    }
                 } else if io::Error::from(error).kind() == io::ErrorKind::NotFound {
                     Ok(Outcome::Replan)
                 } else {
@@ -470,6 +507,38 @@ mod tests {
                 item,
             )
         }
+    }
+
+    #[test]
+    fn displaced_edit_is_preserved_and_temp_removed() {
+        let f = Fixture::new();
+        f.write(b"old");
+        let item = f.scan();
+        let path = f.dir.path().join(".nv-sync-displaced");
+        fs::write(&path, b"new local edit").unwrap();
+        let Outcome::ConflictCopy { name } =
+            finish_displaced(&path, f.dir.path(), item.local.as_ref().unwrap()).unwrap()
+        else {
+            panic!("expected preserved displaced edit");
+        };
+        assert_eq!(f.read(&name), b"new local edit");
+        assert!(!path.exists());
+        assert_eq!(fs::read_dir(f.dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn displaced_unchanged_bytes_are_removed_without_copy() {
+        let f = Fixture::new();
+        f.write(b"old");
+        let item = f.scan();
+        let path = f.dir.path().join(".nv-sync-displaced");
+        fs::write(&path, b"old").unwrap();
+        assert_eq!(
+            finish_displaced(&path, f.dir.path(), item.local.as_ref().unwrap()).unwrap(),
+            Outcome::Done
+        );
+        assert!(!path.exists());
+        assert_eq!(fs::read_dir(f.dir.path()).unwrap().count(), 1);
     }
 
     #[test]

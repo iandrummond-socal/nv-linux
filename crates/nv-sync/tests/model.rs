@@ -22,7 +22,9 @@ use nv_sync::dropbox::{DropboxRemote, Endpoints};
 use nv_sync::engine::{Engine, EngineOptions, PassReport};
 use nv_sync::fake::{FakeRemote, SharedFake};
 use nv_sync::plan::{reconcile, Action, LocalFile, SkipReason, MAX_SIZE};
-use nv_sync::remote::{is_note_name, RemoteError};
+use nv_sync::remote::{
+    is_note_name, Cursor, Remote, RemoteChange, RemoteError, RemoteFile, RemoteResult,
+};
 use nv_sync::secret::Secret;
 use nv_sync::state::STATE_FILE;
 use nv_sync::tokens::{FileStore, StoredLogin, TokenStore};
@@ -333,6 +335,73 @@ fn settle(engine: &mut Engine, allow_deletes: bool) -> Vec<PassReport> {
         }
     }
     panic!("no quiescence: {reports:?}");
+}
+
+#[test]
+fn same_size_save_during_upload_converges() {
+    struct SaveDuringUpload {
+        remote: SharedFake,
+        path: PathBuf,
+        saved: bool,
+    }
+
+    impl Remote for SaveDuringUpload {
+        fn list(&mut self) -> RemoteResult<(Vec<RemoteFile>, Cursor)> {
+            self.remote.list()
+        }
+
+        fn changes(&mut self, since: &Cursor) -> RemoteResult<(Vec<RemoteChange>, Cursor)> {
+            self.remote.changes(since)
+        }
+
+        fn download(&mut self, id: &str) -> RemoteResult<Vec<u8>> {
+            self.remote.download(id)
+        }
+
+        fn upload(
+            &mut self,
+            name: &str,
+            bytes: &[u8],
+            expect_rev: Option<&str>,
+        ) -> RemoteResult<RemoteFile> {
+            if !self.saved {
+                assert_eq!(bytes, b"bbbb");
+                let mtime = fs::metadata(&self.path).unwrap().modified().unwrap();
+                fs::write(&self.path, b"cccc").unwrap();
+                File::open(&self.path)
+                    .unwrap()
+                    .set_modified(mtime + Duration::from_secs(2))
+                    .unwrap();
+                self.saved = true;
+            }
+            self.remote.upload(name, bytes, expect_rev)
+        }
+
+        fn delete(&mut self, id: &str, parent_rev: &str) -> RemoteResult<()> {
+            self.remote.delete(id, parent_rev)
+        }
+    }
+
+    let fx = Fx::new();
+    fx.write("note.txt", b"bbbb");
+    let mut engine = Engine::new(
+        fx.opts_for(fx.notes.path(), ACCOUNT),
+        Box::new(SaveDuringUpload {
+            remote: fx.device.clone(),
+            path: fx.path("note.txt"),
+            saved: false,
+        }),
+        Box::new(FakeTrasher {
+            dir: fx.trash.path().to_owned(),
+        }),
+    )
+    .unwrap();
+    settle(&mut engine, false);
+    assert_eq!(fx.local()["note.txt"], b"cccc");
+    assert_eq!(fx.remote()["note.txt"], b"cccc");
+    fx.assert_converged();
+    assert_idempotent(&fx, &mut engine);
+    fx.sweep(None);
 }
 
 fn assert_idempotent(fx: &Fx, engine: &mut Engine) {

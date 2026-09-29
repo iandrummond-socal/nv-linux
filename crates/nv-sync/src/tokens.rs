@@ -5,6 +5,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -192,6 +193,7 @@ impl TokenStore for FileStore {
 pub struct DefaultStore {
     keyring: Option<Box<dyn TokenStore>>,
     file: FileStore,
+    last: Mutex<Option<&'static str>>,
 }
 
 impl TokenStore for DefaultStore {
@@ -199,7 +201,14 @@ impl TokenStore for DefaultStore {
         let primary = self.keyring.as_ref().map_or(Ok(None), |store| store.load());
         let fallback = self.file.load();
         match (primary, fallback) {
-            (Ok(Some(login)), _) | (_, Ok(Some(login))) => Ok(Some(login)),
+            (Ok(Some(login)), _) => {
+                *self.last.lock().unwrap() = Some("keyring");
+                Ok(Some(login))
+            }
+            (_, Ok(Some(login))) => {
+                *self.last.lock().unwrap() = Some("file");
+                Ok(Some(login))
+            }
             (Err(error), _) | (_, Err(error)) => Err(error),
             (Ok(None), Ok(None)) => Ok(None),
         }
@@ -208,16 +217,20 @@ impl TokenStore for DefaultStore {
     fn save(&self, login: &StoredLogin) -> Result<()> {
         if let Some(primary) = &self.keyring {
             if primary.save(login).is_ok() {
+                *self.last.lock().unwrap() = Some("keyring");
                 return self.file.clear();
             }
             log::warn!("Dropbox keyring save failed; storing login in file");
             self.file.save(login)?;
+            *self.last.lock().unwrap() = Some("file");
             if primary.clear().is_err() {
                 log::warn!("Dropbox keyring cleanup failed; login stored in file");
             }
             return Ok(());
         }
-        self.file.save(login)
+        self.file.save(login)?;
+        *self.last.lock().unwrap() = Some("file");
+        Ok(())
     }
 
     fn clear(&self) -> Result<()> {
@@ -227,7 +240,9 @@ impl TokenStore for DefaultStore {
     }
 
     fn describe(&self) -> &'static str {
-        if self.keyring.is_some() {
+        if let Some(last) = *self.last.lock().unwrap() {
+            last
+        } else if self.keyring.is_some() {
             "keyring"
         } else {
             "file"
@@ -239,6 +254,7 @@ pub fn default_store(state_dir: &Path) -> DefaultStore {
     let store = DefaultStore {
         keyring: KeyringStore::available().then(|| Box::new(KeyringStore) as Box<dyn TokenStore>),
         file: FileStore::new(state_dir),
+        last: Mutex::new(None),
     };
     log::info!("Dropbox login stored in {}", store.describe());
     store
@@ -247,7 +263,6 @@ pub fn default_store(state_dir: &Path) -> DefaultStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use tempfile::tempdir;
 
     fn login(token: &str) -> StoredLogin {
@@ -351,6 +366,7 @@ mod tests {
                 fail_load_and_clear: false,
             })),
             file: FileStore::new(dir),
+            last: Mutex::new(None),
         }
     }
 
@@ -364,8 +380,10 @@ mod tests {
                 fail_load_and_clear: false,
             })),
             file: FileStore::new(dir.path()),
+            last: Mutex::new(None),
         };
         store.save(&login("new")).unwrap();
+        assert_eq!(store.describe(), "file");
         assert!(store.keyring.as_ref().unwrap().load().unwrap().is_none());
         assert_eq!(
             store.file.load().unwrap().unwrap().refresh_token.expose(),
@@ -384,9 +402,11 @@ mod tests {
                 fail_load_and_clear: true,
             })),
             file: FileStore::new(dir.path()),
+            last: Mutex::new(None),
         };
         store.file.save(&login("old-file")).unwrap();
         store.save(&login("new")).unwrap();
+        assert_eq!(store.describe(), "file");
         assert!(store.keyring.as_ref().unwrap().load().is_err());
         for loaded in [store.file.load(), store.load()] {
             let loaded = loaded.unwrap().unwrap();
@@ -402,6 +422,7 @@ mod tests {
         let store = injected(dir.path(), false);
         store.file.save(&login("old")).unwrap();
         store.save(&login("new")).unwrap();
+        assert_eq!(store.describe(), "keyring");
         assert!(!store.file.path.exists());
         assert_eq!(
             store
@@ -426,6 +447,7 @@ mod tests {
             store.load().unwrap().unwrap().refresh_token.expose(),
             "fallback"
         );
+        assert_eq!(store.describe(), "file");
         store
             .keyring
             .as_ref()
@@ -436,6 +458,7 @@ mod tests {
             store.load().unwrap().unwrap().refresh_token.expose(),
             "primary"
         );
+        assert_eq!(store.describe(), "keyring");
         store.clear().unwrap();
         assert!(store.load().unwrap().is_none());
     }

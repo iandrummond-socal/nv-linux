@@ -191,6 +191,69 @@ fn dropbox_client_folders(home: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Preserve displaced downloads left behind by an interrupted replacement.
+fn recover_leftovers(dir: &Path) -> Vec<String> {
+    let mut recovered = Vec::new();
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            log::warn!("Cannot scan sync leftovers: {error}");
+            return recovered;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                log::warn!("Cannot inspect sync leftover: {error}");
+                continue;
+            }
+        };
+        if !entry.file_name().to_string_lossy().starts_with(".nv-sync-") {
+            continue;
+        }
+        let path = entry.path();
+        let result = (|| -> Result<Option<String>> {
+            if !fs::symlink_metadata(&path)?.is_file() {
+                return Ok(None);
+            }
+            let bytes = read_stable(&path)?;
+            let hash = content_hash(&bytes);
+            let mut preserved = bytes.is_empty();
+            if !preserved {
+                for note in fs::read_dir(dir)? {
+                    let note = note?.path();
+                    if is_note_path(&note)
+                        && fs::symlink_metadata(&note)?.is_file()
+                        && content_hash(&read_stable(&note)?) == hash
+                    {
+                        preserved = true;
+                        break;
+                    }
+                }
+            }
+            if preserved {
+                fs::remove_file(&path)?;
+                return Ok(None);
+            }
+            let name = apply::conflict_name(dir, "Recovered note.txt", chrono::Local::now());
+            fs::hard_link(&path, dir.join(&name))?;
+            File::open(dir)?.sync_all()?;
+            fs::remove_file(&path)?;
+            Ok(Some(name))
+        })();
+        match result {
+            Ok(Some(name)) => {
+                log::warn!("Recovered sync leftover as {name}");
+                recovered.push(name);
+            }
+            Ok(None) => {}
+            Err(error) => log::warn!("Cannot recover sync leftover {}: {error}", path.display()),
+        }
+    }
+    recovered
+}
+
 impl Engine {
     pub fn new(
         opts: EngineOptions,
@@ -223,6 +286,7 @@ impl Engine {
         fs::create_dir_all(&opts.state_dir)?;
         let lock = try_lock(&opts.state_dir)?.ok_or(Error::Locked)?;
         let state = SyncState::load(&opts.state_dir, &opts.notes_dir, Some(&opts.account_id))?;
+        recover_leftovers(&opts.notes_dir);
         Ok(Engine {
             dir: opts.notes_dir,
             state_dir: opts.state_dir,
@@ -1052,6 +1116,42 @@ mod tests {
         assert!(matches!(f.try_engine(f.opts()), Err(Error::Locked)));
         drop(first);
         assert!(f.try_engine(f.opts()).is_ok());
+    }
+
+    #[test]
+    fn engine_recovers_unique_leftover() {
+        let f = Fx::new();
+        f.write(".nv-sync-abc", b"displaced text");
+        let _engine = f.engine();
+        assert!(!f.notes.path().join(".nv-sync-abc").exists());
+        let files = f.local();
+        assert_eq!(files.len(), 1);
+        let (name, bytes) = files.iter().next().unwrap();
+        assert!(name.starts_with("Recovered note (conflict "));
+        assert!(name.ends_with(").txt"));
+        assert_eq!(bytes, b"displaced text");
+    }
+
+    #[test]
+    fn engine_removes_duplicate_leftover() {
+        let f = Fx::new();
+        f.write("Existing.md", b"preserved text");
+        f.write(".nv-sync-abc", b"preserved text");
+        let _engine = f.engine();
+        assert!(!f.notes.path().join(".nv-sync-abc").exists());
+        assert_eq!(
+            f.local(),
+            BTreeMap::from([("Existing.md".into(), b"preserved text".to_vec())])
+        );
+    }
+
+    #[test]
+    fn engine_removes_empty_leftover() {
+        let f = Fx::new();
+        f.write(".nv-sync-abc", b"");
+        let _engine = f.engine();
+        assert!(!f.notes.path().join(".nv-sync-abc").exists());
+        assert!(f.local().is_empty());
     }
 
     // ---- cold start twins ----

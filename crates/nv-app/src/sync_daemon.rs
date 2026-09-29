@@ -5,8 +5,14 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
 use nv_sync::engine::SyncStatus;
+use nv_sync::tokens::TokenStore;
 
 use crate::sync_ui::{start_engine, OffReason, StartDeps, StartOutcome};
+
+#[cfg(not(test))]
+const LOGIN_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const LOGIN_CHECK_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Sync until the process is stopped, logging to the command's output.
 pub fn run(ctx: &mut crate::sync_cli::Ctx) -> i32 {
@@ -22,21 +28,37 @@ pub(crate) fn run_with_output(out: &mut dyn Write) -> i32 {
             .ok_or_else(|| "can't find a state folder (set NV_STATE_DIR)".to_owned())?;
         Ok(StartDeps::production(config, state_dir))
     };
+    let mut check_login = || {
+        let state_dir = nv_sync::state::state_dir_with(&|key| std::env::var(key).ok())?;
+        let login = nv_sync::tokens::default_store(&state_dir).load().ok()??;
+        Some(format!(
+            "{}:{}",
+            login.account_id,
+            nv_sync::content_hash::content_hash(login.refresh_token.expose().as_bytes())
+        ))
+    };
     // systemd's SIGTERM ends the process; atomic writes and persisted pending
     // operations keep the engine crash-safe at every step.
-    run_loop(&mut make_deps, &mut std::thread::sleep, out, None)
+    run_loop(
+        &mut make_deps,
+        &mut check_login,
+        &mut std::thread::sleep,
+        out,
+        None,
+    )
 }
 
 /// Retry starts and report status changes with injected dependencies and sleep.
 pub(crate) fn run_loop(
     make_deps: &mut dyn FnMut() -> Result<StartDeps, String>,
+    check_login: &mut dyn FnMut() -> Option<String>,
     sleep: &mut dyn FnMut(Duration),
     out: &mut dyn Write,
     max_attempts: Option<usize>,
 ) -> i32 {
     let mut previous = None;
     let mut attempts = 0;
-    while max_attempts.is_none_or(|limit| attempts < limit) {
+    'attempt: while max_attempts.is_none_or(|limit| attempts < limit) {
         attempts += 1;
         let deps = match make_deps() {
             Ok(deps) => deps,
@@ -54,6 +76,7 @@ pub(crate) fn run_loop(
         let (tx, rx) = mpsc::channel::<SyncStatus>();
         match start_engine(deps, tx) {
             StartOutcome::Started(handle) => {
+                let login = check_login();
                 // Every new engine gets a start line, even if its folder is unchanged.
                 previous = None;
                 log_line(
@@ -62,7 +85,7 @@ pub(crate) fn run_loop(
                     format!("syncing {}", notes_dir.display()),
                 );
                 loop {
-                    match rx.recv_timeout(Duration::from_secs(60)) {
+                    match rx.recv_timeout(LOGIN_CHECK_INTERVAL) {
                         Ok(status) => {
                             if let Some(line) = status_line(&status) {
                                 log_line(out, &mut previous, line);
@@ -77,7 +100,17 @@ pub(crate) fn run_loop(
                             handle.stop();
                             break;
                         }
-                        Err(RecvTimeoutError::Timeout) => {}
+                        Err(RecvTimeoutError::Timeout) => {
+                            if check_login() != login {
+                                log_line(
+                                    out,
+                                    &mut previous,
+                                    "the Dropbox sign-in changed — restarting sync".into(),
+                                );
+                                handle.stop();
+                                continue 'attempt;
+                            }
+                        }
                     }
                 }
                 sleep(Duration::from_secs(30));
@@ -220,6 +253,7 @@ mod tests {
         assert_eq!(
             run_loop(
                 &mut make_deps,
+                &mut || None,
                 &mut |duration| sleeps.push(duration),
                 &mut out,
                 Some(3),
@@ -255,6 +289,51 @@ mod tests {
             retry_log(|| Ok(deps(root.path(), true)), 30),
             "the app is syncing these notes — waiting to take over when it closes\n"
         );
+    }
+
+    fn login_change_restarts(next_login: Option<String>) {
+        let (done, finished) = mpsc::channel();
+        std::thread::spawn(move || {
+            let root = tempfile::tempdir().unwrap();
+            let mut attempts = 0;
+            let mut logins = [Some("a".into()), next_login].into_iter();
+            let mut sleeps = Vec::new();
+            let mut out = Vec::new();
+            assert_eq!(
+                run_loop(
+                    &mut || {
+                        attempts += 1;
+                        Ok(deps(root.path(), attempts == 1))
+                    },
+                    &mut || logins.next().expect("unexpected login check"),
+                    &mut |duration| sleeps.push(duration),
+                    &mut out,
+                    Some(2),
+                ),
+                0
+            );
+            assert_eq!(attempts, 2);
+            assert!(logins.next().is_none());
+            assert_eq!(sleeps, vec![Duration::from_secs(60)]);
+            let out = String::from_utf8(out).unwrap();
+            assert!(out.contains("syncing "));
+            assert!(out.contains("the Dropbox sign-in changed — restarting sync\n"));
+            assert!(nv_sync::engine::try_lock(root.path()).unwrap().is_some());
+            done.send(()).unwrap();
+        });
+        finished
+            .recv_timeout(Duration::from_secs(10))
+            .expect("login change did not restart sync promptly");
+    }
+
+    #[test]
+    fn reconnect_restarts_without_sleep() {
+        login_change_restarts(Some("b".into()));
+    }
+
+    #[test]
+    fn disconnect_restarts_without_sleep() {
+        login_change_restarts(None);
     }
 
     #[test]
