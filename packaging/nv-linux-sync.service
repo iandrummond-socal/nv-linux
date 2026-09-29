@@ -1,0 +1,14 @@
+[Unit]
+Description=nv-linux Dropbox sync for your notes
+Documentation=file:///usr/share/doc/nv-linux/README.md
+After=network-online.target graphical-session.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/nv-linux sync run
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

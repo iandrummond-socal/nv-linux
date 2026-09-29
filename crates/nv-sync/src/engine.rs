@@ -59,6 +59,9 @@ pub enum SyncStatus {
     Off,
     Starting,
     Syncing,
+    /// Another process holds the sync lock and is syncing these notes; set by a
+    /// front end, never sent by the engine.
+    Background,
     Idle {
         last_ok: chrono::DateTime<chrono::Utc>,
     },

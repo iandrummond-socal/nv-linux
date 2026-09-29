@@ -3,6 +3,7 @@ mod editor;
 mod note_list;
 mod search_field;
 mod sync_cli;
+mod sync_daemon;
 mod sync_ui;
 mod theming;
 mod window;

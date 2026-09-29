@@ -44,6 +44,7 @@ pub fn status_text(status: &SyncStatus, conflicts: usize, now: DateTime<Utc>) ->
         SyncStatus::Off => return None,
         SyncStatus::Starting | SyncStatus::Syncing => "↻ syncing".to_owned(),
         SyncStatus::Idle { last_ok } => format!("✓ synced {}", ago(*last_ok, now)),
+        SyncStatus::Background => "syncing in background".to_owned(),
         SyncStatus::Offline => "offline".to_owned(),
         SyncStatus::AuthExpired => "reconnect Dropbox · Ctrl+Shift+D".to_owned(),
         SyncStatus::Attention(message) => format!("⚠ {}", shorten(message)),
@@ -344,7 +345,7 @@ pub fn sync_gate(config: &Config) -> Result<(), OffReason> {
 pub enum StartOutcome {
     Started(EngineHandle),
     Off(OffReason),
-    /// Another syncer holds the lock and is doing the job: show nothing.
+    /// Another syncer (the background service or another app instance) holds the lock: the indicator says so and the app retries.
     Locked,
     /// Connected, but the engine refused to start: shown in the indicator.
     Failed(String),
@@ -438,7 +439,7 @@ pub fn sync_now_refusal(state: &EngineState) -> String {
             "config.toml has a mistake, so sync is paused".into()
         }
         EngineState::Starting | EngineState::Running => "Sync is starting".into(),
-        EngineState::Locked => "Another nv-linux is already syncing these notes".into(),
+        EngineState::Locked => "The background service is syncing these notes".into(),
         EngineState::Failed(message) => format!("Sync couldn't start: {message}"),
     }
 }
@@ -452,6 +453,8 @@ pub struct SyncService {
     handle: RefCell<Option<EngineHandle>>,
     state: RefCell<EngineState>,
     restart_pending: Cell<bool>,
+    retry_scheduled: Cell<bool>,
+    shutting_down: Cell<bool>,
 }
 
 impl SyncService {
@@ -463,6 +466,8 @@ impl SyncService {
             handle: RefCell::new(None),
             state: RefCell::new(EngineState::NotStarted),
             restart_pending: Cell::new(false),
+            retry_scheduled: Cell::new(false),
+            shutting_down: Cell::new(false),
         })
     }
 
@@ -490,6 +495,9 @@ impl SyncService {
     /// stopped before the new one takes the lock. The keyring read and the
     /// engine start run on a worker thread; the result lands on the main context.
     pub fn start(self: &Rc<Self>) {
+        if self.shutting_down.get() {
+            return;
+        }
         if *self.state.borrow() == EngineState::Starting {
             self.restart_pending.set(true);
             return;
@@ -538,6 +546,9 @@ impl SyncService {
     }
 
     fn finish_start(self: &Rc<Self>, outcome: StartOutcome) {
+        if self.shutting_down.get() {
+            return;
+        }
         let (state, status) = match outcome {
             StartOutcome::Started(handle) => {
                 self.handle.replace(Some(handle));
@@ -545,7 +556,7 @@ impl SyncService {
                 (EngineState::Running, None)
             }
             StartOutcome::Off(reason) => (EngineState::Off(reason), Some(SyncStatus::Off)),
-            StartOutcome::Locked => (EngineState::Locked, Some(SyncStatus::Off)),
+            StartOutcome::Locked => (EngineState::Locked, Some(SyncStatus::Background)),
             StartOutcome::Failed(message) => (
                 EngineState::Failed(message.clone()),
                 Some(SyncStatus::Attention(message)),
@@ -554,6 +565,17 @@ impl SyncService {
         self.state.replace(state);
         if let Some(status) = status {
             self.hub.set_status(status);
+        }
+        if *self.state.borrow() == EngineState::Locked && !self.retry_scheduled.replace(true) {
+            let weak = Rc::downgrade(self);
+            glib::timeout_add_seconds_local_once(60, move || {
+                if let Some(this) = weak.upgrade() {
+                    this.retry_scheduled.set(false);
+                    if !this.shutting_down.get() && *this.state.borrow() == EngineState::Locked {
+                        this.start();
+                    }
+                }
+            });
         }
         if self.restart_pending.replace(false) {
             self.start();
@@ -574,6 +596,7 @@ impl SyncService {
     /// On quit: one last pass (≤ [`FLUSH_TIMEOUT`]), then stop. A pass still
     /// running past the timeout is told to stop and not waited on.
     pub fn shutdown(&self) {
+        self.shutting_down.set(true);
         self.restart_pending.set(false);
         let handle = self.handle.borrow_mut().take();
         if let Some(handle) = handle {
@@ -803,6 +826,12 @@ mod tests {
         let cases: Vec<(SyncStatus, usize, &str)> = vec![
             (SyncStatus::Starting, 0, "↻ syncing"),
             (SyncStatus::Syncing, 0, "↻ syncing"),
+            (SyncStatus::Background, 0, "syncing in background"),
+            (
+                SyncStatus::Background,
+                2,
+                "syncing in background · ⚠ 2 conflicts",
+            ),
             (idle(0), 0, "✓ synced just now"),
             (idle(59), 0, "✓ synced just now"),
             (idle(60), 0, "✓ synced 1m ago"),
@@ -877,6 +906,8 @@ mod tests {
         assert_eq!(status_tone(&SyncStatus::Syncing, 0), Tone::Busy);
         assert_eq!(status_tone(&SyncStatus::Starting, 0), Tone::Busy);
         assert_eq!(status_tone(&idle(10), 0), Tone::Quiet);
+        assert_eq!(status_tone(&SyncStatus::Background, 0), Tone::Quiet);
+        assert_eq!(status_tone(&SyncStatus::Background, 1), Tone::Warn);
         assert_eq!(status_tone(&SyncStatus::Offline, 0), Tone::Quiet);
         assert_eq!(status_tone(&SyncStatus::AuthExpired, 0), Tone::Warn);
         assert_eq!(
@@ -1352,7 +1383,7 @@ mod tests {
         assert!(rx.recv().is_err());
         assert_eq!(
             sync_now_refusal(&EngineState::Locked),
-            "Another nv-linux is already syncing these notes"
+            "The background service is syncing these notes"
         );
     }
 

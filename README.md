@@ -103,7 +103,7 @@ In nv-linux, press Ctrl+Shift+D to open Dropbox's allow page in your browser, th
 The app says `Connected to Dropbox as <email>`.
 From a terminal, `nv-linux sync connect` reads the code from the terminal, runs a first sync, and prints how many notes went up and came down; `--no-open` skips opening the browser.
 
-A small mark at the bottom-right of the window shows ↻ while syncing, ✓ with how long ago it synced, `offline`, `reconnect Dropbox · Ctrl+Shift+D` when the sign-in has expired, or ⚠ with a count of conflict copies.
+A small mark at the bottom-right of the window shows ↻ while syncing, ✓ with how long ago it synced, `syncing in background`, `offline`, `reconnect Dropbox · Ctrl+Shift+D` when the sign-in has expired, or ⚠ with a count of conflict copies.
 Nothing is shown when sync isn't connected.
 
 - Sync runs on launch, then within a couple of seconds of any change on either side while the app is open; Ctrl+Shift+Y syncs now.
@@ -123,9 +123,19 @@ Sync bookkeeping lives in `~/.local/state/nv-linux/`.
 | `nv-linux sync connect` | Connect to Dropbox and run a first sync |
 | `nv-linux sync status` | Show account, last sync, waiting changes, and conflict copies; exit code 0 when healthy, 1 when something needs you — scriptable |
 | `nv-linux sync now [--allow-deletes]` | Run one sync pass |
-| `nv-linux sync disconnect` | Sign out and forget sync bookkeeping; never touches a note, here or in Dropbox |
+| `nv-linux sync run` | Sync in the background until stopped (what the service runs) |
+| `nv-linux sync disconnect` | Sign out and forget sync bookkeeping; never touches a note, here or in Dropbox (stop the background service first if it's on) |
 
 To turn sync off without disconnecting, set `enabled = false` under `[sync]`.
+
+### Background sync (optional)
+
+By default, notes sync while the app is open.
+To keep them syncing with the app closed, turn on the user service once with `systemctl --user enable --now nv-linux-sync`.
+The app and the service never sync at the same time — whichever starts first syncs, and when the service is syncing, the app's mark says `syncing in background`.
+See what it's doing with `journalctl --user -u nv-linux-sync`.
+Turn it off with `systemctl --user disable --now nv-linux-sync`.
+It picks up a reconnect by itself.
 
 ## Settings
 

@@ -1,4 +1,4 @@
-//! `nv-linux sync connect | status | now | disconnect`.
+//! `nv-linux sync connect | status | now | run | disconnect`.
 //!
 //! Parsing is a pure function, and every command runs against injected
 //! dependencies ([`Ctx`]), so the whole flow is testable without the network,
@@ -35,6 +35,7 @@ Commands:
   connect [--no-open]     Sign in to Dropbox and run the first sync
   status                  Show the connection and last sync (exit 1 if it needs attention)
   now [--allow-deletes]   Run one sync pass now
+  run                     sync in the background until stopped (used by the nv-linux-sync user service)
   disconnect              Sign out of Dropbox; your notes stay where they are
 ";
 
@@ -43,6 +44,7 @@ pub enum SyncCommand {
     Connect { open_browser: bool },
     Status,
     Now { allow_deletes: bool },
+    Run,
     Disconnect,
     Help,
 }
@@ -62,7 +64,7 @@ pub fn parse(args: &[String]) -> Result<SyncCommand, UsageError> {
         "help" | "-h" | "--help" => return Ok(SyncCommand::Help),
         "connect" => &["--no-open"],
         "now" => &["--allow-deletes"],
-        "status" | "disconnect" => &[],
+        "status" | "disconnect" | "run" => &[],
         other => return Err(UsageError(format!("unknown command '{other}'"))),
     };
     if let Some(extra) = rest.iter().find(|arg| !allowed.contains(&arg.as_str())) {
@@ -79,6 +81,7 @@ pub fn parse(args: &[String]) -> Result<SyncCommand, UsageError> {
             allow_deletes: has("--allow-deletes"),
         },
         "status" => SyncCommand::Status,
+        "run" => SyncCommand::Run,
         _ => SyncCommand::Disconnect,
     })
 }
@@ -188,6 +191,10 @@ pub fn run_from_env(args: &[String]) -> i32 {
         print!("{USAGE}");
         return EXIT_OK;
     }
+    // The daemon loads its own dependencies so startup errors are retried too.
+    if command == SyncCommand::Run {
+        return crate::sync_daemon::run_with_output(&mut io::stdout());
+    }
     let config = match Config::load() {
         Ok(config) => config,
         Err(error) => {
@@ -236,6 +243,7 @@ pub fn execute(command: SyncCommand, ctx: &mut Ctx) -> i32 {
         SyncCommand::Connect { open_browser } => connect(ctx, open_browser),
         SyncCommand::Status => status(ctx),
         SyncCommand::Now { allow_deletes } => now(ctx, allow_deletes),
+        SyncCommand::Run => crate::sync_daemon::run(ctx),
         SyncCommand::Disconnect => disconnect(ctx),
         SyncCommand::Help => {
             let _ = write!(ctx.out, "{USAGE}");
@@ -391,7 +399,7 @@ fn pass(ctx: &Ctx, login: &StoredLogin, allow_deletes: bool) -> Result<PassRepor
 pub fn error_message(error: &nv_sync::Error) -> String {
     match error {
         nv_sync::Error::Locked => {
-            "another nv-linux is already syncing; let it finish (or quit the app), then try again."
+            "another nv-linux is already syncing (the app, or the background service); let it finish, then try again."
                 .into()
         }
         nv_sync::Error::Config(message) | nv_sync::Error::Auth(message) => message.clone(),
@@ -595,8 +603,8 @@ fn disconnect(ctx: &mut Ctx) -> i32 {
             Ok(Some(lock)) => Some(lock),
             Ok(None) => {
                 return ctx.fail(
-                    "nv-linux is syncing right now (the app or another sync command); \
-                     quit it, then disconnect.",
+                    "nv-linux is syncing right now (the app, the background service or another sync command); \
+                     quit it — for the service: systemctl --user stop nv-linux-sync — then disconnect.",
                 )
             }
             Err(error) => return ctx.fail(format!("couldn't check for a running sync: {error}")),
@@ -703,6 +711,16 @@ mod tests {
         for help in [&["help"][..], &["--help"], &["-h"], &["now", "--help"]] {
             assert_eq!(parse(&args(help)), Ok(Help));
         }
+    }
+
+    #[test]
+    fn sync_cli_parser_run() {
+        assert_eq!(parse(&args(&["run"])), Ok(SyncCommand::Run));
+    }
+
+    #[test]
+    fn sync_cli_parser_run_rejects_flags() {
+        assert!(matches!(parse(&args(&["run", "--x"])), Err(UsageError(_))));
     }
 
     #[test]
